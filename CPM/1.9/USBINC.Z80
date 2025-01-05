@@ -1,0 +1,1058 @@
+;-----------------------------------------------------
+;
+;	UTools Version 1.8 (von M. Leubner)
+;
+; Hilfsprogramme zur Arbeit mit USB-Sticks unter CP/M
+;
+;	gemeinsam genutzte Unterprogramme und Macros
+;
+; USBINC.Z80 (Include)	    18.01.2008 - 19.11.2024
+;-----------------------------------------------------
+
+debug	equ	0		; zusaetzliche Debug-anzeigen
+VER	EQU	19H		; Version 1.9
+
+; KC-spezifische Einstellungen:
+
+INPTR	EQU	0FFA4H	; Ringpufferzeiger Zusatzeingabe
+OUTPTR	EQU	0FFAAH	; Ringpufferzeiger Zusatzausgabe
+MEMANF	EQU	0FFAEH	; Adresse Speicheranforderung im Koppel-RAM
+VSTAT	EQU	0FFC0H	; VDIP1-Status (von Interrupt Koppeltreiber)
+ID	EQU	26	; ID des USB-Treibers USB.DRV
+
+; Voreinstellungen fuer nicht-KC-Systeme:
+
+BRKT	EQU	1	; Tastaturabfrage bei GET (Abbruch mit Break/ESC) ?
+			; 0 = keine Tastaturabfrage (z.B. beim Z1013)
+			; 1 = kann bei aufwaendigen BIOS-Routinen Uebertragung
+			; sehr stark bremsen!
+
+PIO	EQU	2Ch	; PIO-Basisadresse der USB-PIO
+			; 2Ch beim M052 im KC85-Grundgeraet
+			; DCh beim Z9001
+;PIOA	EQU	PIO	; Daten A (Datenport, bidirektional)
+;PIOB	EQU	PIO+1	; Daten B (Steuersignale, Bitbetrieb)
+; Bit -	7 6 5 4 3 2 1 0
+;	 \ \ \ \ \ \ \ \__RXF#		Eingang	Low = Empfangsdaten verfuegbar
+;	  \ \ \ \ \ \ \___TXE#		Eingang	Low = Bereit zum Daten schreiben
+;	   \ \ \ \ \ \____RD#		Ausgang	Lese-Impuls Low-aktiv
+;	    \ \ \ \ \_____WR		Ausgang	Schreibimpuls High-aktiv
+;	     \ \ \ \______DATAREQ#	Ausgang bei VNC2: Takt zu USB-Tastatur
+;	      \ \ \_______DATAACK#	Eingang bei VNC2: Scan von USB-Tastatur
+;	       \ \________RESET#	Ausgang	Low loest Ruecksetzen aus
+;		\_________PROG#		Ausgang Low schaltet in Programmiermode
+;PIOAS	EQU	PIO+2	; Steuer A
+;PIOBS	EQU	PIO+3	; Steuer B
+;BS	EQU	64	; Bildschirmbreite in Zeichen (40, 64 oder 80 moeglich!)
+
+FREQ	EQU	2	; CPU-Taktfrequenz in MHz
+
+; CP/M-Vereinbarungen:
+
+TAB	EQU	9
+LF	EQU	0AH
+CR	EQU	0DH
+EOF	EQU	1AH
+ESC	EQU	1BH
+BDOS	EQU	5
+_GETVER	EQU	12	; CP/M-Version testen
+_SELDSK	EQU	14	; Laufwerk waehlen
+_FIRST	EQU	17	; ersten Verzeichniseintrag suchen
+_NEXT	EQU	18	; naechsten Verzeichniseintrag suchen
+_GETDRV	EQU	25	; aktuelles Laufwerk holen
+_GETDPB	EQU	31	; DPB-Adresse holen
+_SETUSR	EQU	32	; USER waehlen
+_CALC	EQU	35	; Dateigroesse berechnen
+_DOSVER	EQU	48	; erweiterte DOS-Version holen
+_GETCLK	EQU	98	; Uhrzeit holen
+_GETDAT	EQU	102	; Datumstempel lesen
+_SETDAT	EQU	103	; Datumstempel schreiben
+FCB1	EQU	5CH	; erster FCB
+FCB2	EQU	6CH	; zweiter FCB
+DEFDMA	EQU	80H	; Standard-DMA-Puffer
+
+; Vinculum-Kommandos:
+
+DIR	EQU	01H	; List file(s)
+DLF	EQU	07H	; Delete File
+WRF	EQU	08H	; Write to File
+OPW	EQU	09H	; Open/write
+CLF	EQU	0AH	; Close
+RDF	EQU	0BH	; Read from File
+OPR	EQU	0EH	; Open/read
+SCS	EQU	10H	; Short CMD
+ECS	EQU	11H	; Extend. CMD
+DIRT	EQU	2FH	; List File Date&Time
+IPH	EQU	91H	; Binaer-Modus einstellen
+;CPM	EQU	'R1'	; Roll-Mode einschalten fuer CP/M-Tastaturbelegung
+;CAOS	EQU	'R0'	; Roll-Mode ausschalten fuer CAOS-Tastaturbelegung
+
+; Verwendung fertiger Routinen:
+
+EXT	$MEMRY		; Endadresse von Linker
+
+	.request	DSLIBS
+EXT	M2UTIM		; DOS-Datum zu ZSDOS konvertieren
+EXT	U2MTIM		; ZSDOS-Datum zu DOS konvertieren
+EXT	TIMINI		; Zeit- und Datumstempelmethode ermitteln
+EXT	RCLOCK		; ZSDOS-Systemzeit lesen
+
+	.request	SYSLIBS
+EXT	INITFCB		; FCB initialisieren
+EXT	SETDMA		; DMA-Adresse einstellen
+EXT	F$OPEN		; Datei oeffnen
+EXT	F$DELETE	; Datei loeschen
+EXT	F$MAKE		; Datei erzeugen
+EXT	F$WRITE		; Sektor in Datei schreiben
+EXT	F$READ		; Sektor aus Datei lesen
+EXT	F$CLOSE		; Datei schliessen
+EXT	PFN2		; Dateiname anzeigen
+EXT	COUT		; Zeichenausgabe zu CON:
+EXT	POUT		; Zeichenausgabe zu PUN:
+EXT	RIN		; Zeicheneingabe von RDR:
+EXT	EPRINT		; Zeichenkette anzeigen
+EXT	CAPIN		; Tastaturabfrage mit UPCASE
+EXT	CONDIN		; Tastaturabfrage
+EXT	PUTUD		; aktuelles DU: sichern
+EXT	GETUD		; gemerktes DU: regenerieren
+EXT	PA2HC		; A als 2stellige HEX/BCD-Zahl anzeigen
+EXT	PHLFDC		; HL als 1-5stellige Dezimalzahl anzeigen
+EXT	PHLDC		; HL als Dezimalzahl mit Leerzeichen anzeigen
+
+	.request	KCLIBS
+EXT	DIV32		; 32-Bit-Division (BC = HLBC / DE)
+EXT	MUL32		; 32-Bit-Multilpikation (HLBC = BC * DE)
+EXT	READ1		; 1 Byte aus dem Speicher im Grundgeraet lesen
+
+; ---------------------------------------------------------
+
+; Optionen aus DMA-Puffer ermitteln und abspeichern:
+
+setopt	macro		; nicht in USB.COM verwendet
+; Verwendung der Optionsbits in allen Programmen gleich, aber nicht alle genutzt
+;
+;	DB	00000010b	; Optionen (Voreinstellung):
+; V	Bit 0	       ^--------- Anzeige der noch vorhandenen Daten bei Start
+; S	Bit 1	      ^---------- Verzeichnis sortieren?
+; O	Bit 2	     ^----------- vorhandene Datei ueberschreiben?
+; I	Bit 3	    ^------------ vorhandene Datei ignorieren?
+; U	Bit 3+2     ^^----------- vorhandene Datei aktualisieren?
+; T/B	Bit 4	   ^------------- Textdatei?
+; W	Bit 5	  ^-------------- Ausfuehrliche Verzeichnisanzeige
+; P	Bit 6	 ^--------------- noch frei (evtl. Druckprotokoll?)
+; M	Bit 7	^---------------- Fortschrittsanzeige (0=% 1=#)
+
+	ld	hl,defdma	; Optionen in DMA-Puffer testen
+	ld	a,(hl)		; Anzahl Zeichen
+	or	a
+	jr	z,opt11		; kein Parameter angegeben
+	ld	b,a
+	inc	hl		; erstes Zeichen
+opt0:	ld	a,(hl)
+	inc	hl
+	cp	'/'		; Option(en) einleiten?
+	jr	z,getopt
+	djnz	opt0
+	jr	opt11		; keine Option aendern
+	;
+getopt:	ex	de,hl		; Rest der Kommanzozeile jetzt in DE
+	ld	hl,option	; Options-Flags
+	ld	a,(de)
+	cp	'/'
+	jp	z,help		; // ist Hilfe
+opt1:	ld	a,(de)		; Optionen testen
+	cp	'O'		; ungefragt ueberschreiben?
+	jr	nz,opt2
+	set	2,(hl)
+	res	3,(hl)
+opt2:	cp	'T'		; Textdatei?
+	jr	nz,opt3
+	set	4,(hl)
+opt3:	cp	'B'		; Binaerdatei?
+	jr	nz,opt4
+	res	4,(hl)
+opt4:	cp	'V'		; alte Daten anzeigen?
+	jr	nz,opt5
+	set	0,(hl)
+opt5:	cp	'S'		; Liste sortieren?
+	jr	nz,opt6
+	set	1,(hl)
+opt6:	cp	'I'		; vorhandene Datei ignorieren?
+	jr	nz,opt7
+	res	2,(hl)
+	set	3,(hl)
+opt7:	cp	'W'		; ausfuehrliche Anzeige?
+	jr	nz,opt8
+	set	5,(hl)
+opt8:	cp	'M'		; Fortschrittsanzeige wie MTOOLs?
+	jr	nz,opt9
+	set	7,(hl)
+opt9:	cp	'U'		; vorhandene Dateien aktualisieren?
+	jr	nz,opt10
+	set	2,(hl)
+	set	3,(hl)
+opt10:	inc	de
+	djnz	opt1
+opt11:
+	endm
+;
+; Sprungtabelle fuer KC85 und Nicht-KC85-Systeme
+;
+GET:	JP	KCGET		; Zusatzeingabe mit Break und TimeOut
+PUT:	JP	POUT		; Zusatzausgabe (Koppeltreiber)
+STATUS:	JP	STAT17		; Status abfragen
+
+; Bei CP/M-Version ist die Taktfrequenz im CONFIG-Bereich einzutragen
+; Beim KC85 kann sie per Software ermittelt werden.
+; Erkennung ob D004 oder D008 V1.0 / V2.0 vorliegt,
+; Danach die Taktfrequenz ermitteln und im CONFIG-Bereich eintragen
+GETTAKT:
+;
+; 1. Suche der KC85-Kennung im BIOS
+;
+	LD	C,_GETDRV	; aktuelles BDOS-Laufwerk holen
+	CALL	BDOS
+	LD	(DOSDRV),A	; und merken
+	LD	C,0		; Laufwerk A:
+	CALL	SELDSK		; Laufwerk im BIOS vorwaehlen
+	PUSH	HL		; DPH-Adresse merken
+DOSDRV	EQU	$+1
+	LD	C,0		; BDOS-Laufwerk sofort wieder regenerieren
+	CALL	SELDSK		; Laufwerk im BIOS vorwaehlen
+	POP	HL
+;
+; 10.04.2022: Beim BIOS des KC85 steht unmittelbar vor den DPH-Adressen die
+; Kennung "85". Diese wird hier gesucht und zur Unterscheidung KC-System oder
+; anderes CP/M-System verwendet.
+; 23.11.2022: Da beim AC1-2010 die BIOS-Kennung von HRCPM12 'C85AC' ist, habe
+; ich den Test auf das Byte nach der Zeichenkette "85" ausgeweitet. Beim KC85
+; folgt dort immer 00H (MicroDOS=Lizenznummer, MLDOS=CCP-Adresse, welche immer
+; auf einer vollen Page beginnt!
+; 16.04.2024: Beim M064-BIOS im KC85-Grundgeraet wurde als Kennung "854" bzw.
+; "853" je nach KC-Typ definiert. Damit erkennen die USB-Tools, dass es sich
+; nicht um ein KC85-System mit D004/D008 handelt. Es wird also auf ein M052
+; direkt zugegriffen. Voraussetzung: PIO ist in Zugriff.
+; 19.11.2024: Beim CP/M im KC85-Grundgeraet darf die PIO nicht neu initialisiert
+; werden. Deshalb wird das zusaetzlich noch mit abgetestet
+;
+FIND1:	LD	A,(HL)
+	CP	'5'
+	JR	NZ,FIND2
+	DEC	HL
+	LD	A,(HL)
+	INC	HL
+	CP	'8'
+	JR	Z,FIND3		; Kennung '85' erkannt
+FIND2:	DEC	L
+	JR	NZ,FIND1	; weitersuchen bis L=0
+
+; kein KC85-System vorgefunden, Routinen fuer CP/M umschreiben:
+
+NOTKC:	LD	HL,CPMGET
+	LD	(GET+1),HL
+	LD	HL,CPMPUT
+	LD	(PUT+1),HL
+	LD	HL,CPMST
+	LD	(STATUS+1),HL
+	RET
+;
+; 2. Ermittlung der Geraetetype (KC85 Grundgeraet)
+;
+FIND3:	INC	HL
+	LD	A,(HL)		; drittes Kennbyte
+	OR	A
+	JR	Z,D004		; D004/D008 erkannt
+	CP	'3'
+	JR	Z,D001
+	CP	'4'
+	JR	NZ,NOTKC	; kein KC85!
+D001:	LD	(D34),A		; KC85-Type in Versionsanzeige
+	AND	0FH		; nur Bit 0-4
+	LD	(KC85),A	; Kennung KC85/3 oder KC85/4 Grundgeraet
+	LD	A,2
+	LD	(TAKT),A	; CPU-Taktfrequenz = 2 MHz
+	JR	NOTKC		; ansonsten die CP/M-Routinen benutzen
+;
+; 3. Ermittlung der Geraetetype (D004/D008) und der aktuellen Taktfrequenz
+;
+D004:	IN	A,(12h)		; D008 V1.0 Erkennung
+	AND	0FEH		; Bits 1-7 testen
+	JR	Z,T1		; alle 7 Bits=0, koennte also D008 V1.0 sein
+	IN	A,(11h)		; D008 V2.0 Erkennung
+	AND	00110000b	; aber nur die Bits 5+4 testen
+	JR	NZ,T2		; also dann muss es eine D004 sein
+T1:	LD	BC,0513h	; 5 Portadressen ab 13h testen:
+V1:	IN	A,(C)		; Bei der D008 V2.0 liegen von 13h bis 17h
+	INC	A		; die RAM-Floppy-Steuerzellen, die in der Grund-
+	JR	NZ,V2		; Initialisierung auf 00h stehen. Sobald 1 Bit
+	DJNZ	V1		; auf 0 steht, muss eine D008 V2.0 vorliegen
+	LD	A,1		; D008 V1.0 erkannt
+	DB	1	; LD BC,nn
+V2:	LD	A,2		; D008 V2.0 erkannt
+	DB	6	; LD B,n
+T2:	XOR	A		; D004 erkannt
+	LD	(KC85),A	; KC85-Kennung fuer D004 oder D008 eintragen
+	LD	C,4		; 4 MHz annehmen
+	OR	A
+	JR	Z,D4		; D004
+	LD	HL,D00
+	LD	(HL),'8'	; D004 umschreiben in D008
+	LD	HL,312Eh	; D008.1
+	DEC	A
+	JR	Z,D81
+; D008 V2.0
+	INC	H		; D008.2
+	IN	A,(11h)		; Bit 0+1 melden aktuelle Taktfrequenz
+	AND	3		; nur diese Bits auswerten
+	JR	Z,D4		; 0=4MHz
+	DEC	A
+	JR	Z,T3		; 1=8MHz
+	SLA	C
+	JR	T3		; 2=16MHz
+; D008 V1.0
+D81:	IN	A,(12h)		; Bit 0 meldet bei Modifikation Taktfrequenz
+	AND	1		; nur dieses Bit filtern
+	JR	NZ,D8		; 1=4MHz
+T3:	SLA	C		; 0=8MHz
+D8:	LD	(D01),HL	; D008-Version eintragen
+D4:	LD	A,C
+	LD	(TAKT),A	; CPU-Taktfrequenz in MHz
+	RET
+;
+; USB initialisieren und synchronisieren:
+;
+; PA:	CY=1	Break, TimeOut oder Error
+; VR:	AF,HL,BC,DE
+
+synchr:	LD	A,(KC85)
+	INC	A		; KC85-System?
+	JR	Z,PINIT		; nein, PIO initialisieren
+
+; Bei KC85-System mit D004 oder D008: Treiber kontrollieren
+
+	CP	4		; KC85 CP/M im Grundgeraet?
+	JP	NC,sync		; ja, keine erneute Initialisierung noetig
+	LD	A,0FFH
+	LD	(MEMANF),A	; MEMANF setzen
+	CALL	EPRINT
+	DB	ESC,'n',ID,0	; Test ob USB-Treiber geladen ist
+drv1:	LD	A,(MEMANF)
+	CP	0FFH
+	JR	Z,drv1		; warten bis Wert aktuell ist
+	CP	0F0H
+	JR	C,drv2		; OK, Treiber vorhanden
+	call	eprint
+	db	'Bitte Treiber USB.DRV laden!',cr,lf,0
+	RST	0
+
+; Versionsnummer des Treibers ermitteln
+
+drv2:	ld	h,a		; Treiber-Adresse H-Teil
+	ld	l,3		; auf Byte 3 steht die Versionsnummer
+	call	read1		; Speicher im Grundgeraet lesen
+	ld	hl,stat17	; Statusabfrage bis USB-Treiber 1.7
+	cp	18h		; Version 1.8 geladen?
+	jr	c,drv3		; nein
+	ld	hl,stat18	; Statusabfrage ab USB-Treiber 1.8
+drv3:	ld	(STATUS+1),hl	; Routine passend eintragen
+	ld	a,2		; Umleitung Koppeltreiber EIN
+	call	DRFUNC		; Treiber aufrufen
+	ld	hl,INPTR	; Pointer fuer RDR:
+	ld	a,(hl)
+	inc	hl
+	ld	(hl),a		; Ringpuffer loeschen/angleichen
+	jr	sync
+
+; Bei Nicht-KC85-Systemen: USB-PIO initialisieren
+
+; PIO Port B:
+
+PINIT:	ld	a,(port)	; PIO-Basisadresse
+	ld	c,a		; PIO A Daten
+	inc	c		; PIO B Daten
+	inc	c		; PIO A Steuerbyte
+	inc	c		; PIO B Steuerbyte
+	ld	a,0CFH		; Bitbetrieb
+	out	(c),a
+	ld	a,00110011b	; I/O festlegen
+	out	(c),a
+	ld	a,07H		; DI, Maske folgt nicht
+	out	(c),a
+;	ld	a,0FFH		; kein Bit aktiv
+;	out	(c),a
+	dec	c		; PIO A Steuerbyte
+	dec	c		; PIO B Daten
+	ld	a,0C4H		; #PROG=1, #RESET=1, RD&WR inaktiv
+	out	(c),a		; PIO B Daten
+	in	a,(c)		; Daten zurueck lesen
+	add	a,1		; wenn FF zurueck kommt, ist PIO nicht vorhanden
+	jr	nc,PIOK
+	call	eprint
+	db	'USB-PIO nicht bereit',cr,lf,0
+	scf			; CY=1 und Abbruch
+	ret
+
+; PIO Port A:
+
+PIOK:	inc	c		; PIO A Steuerbyte
+	ld	a,8FH		; bidirektional
+	out	(c),a
+	ld	a,07H		; kein INT
+	out	(c),a
+	dec	c		; PIO B Daten
+	dec	c		; PIO A Daten
+	in	a,(c)		; Dummy-Eingabe von PIO A
+
+; dreistufiges Synchronisieren mit TimeOut:
+
+sync:	LD	A,(TAKT)	; CPU-Taktfrequenz in MHz
+	LD	B,A
+	LD	hl,0		; Startwert fuer Multiplikation
+	LD	A,(KC85)
+	INC	A
+	ld	de,600		; Faktor fuer Zeitschleife bei CP/M-Version
+	JR	Z,SYN0
+	ld	de,500		; Faktor fuer Zeitschleife bei KC85-Versionen
+SYN0:	add	hl,de		; aufsummieren
+	djnz	SYN0
+	ld	d,h
+	ld	e,l		; DE = Zaehlerwert fuer Zeitschleife
+SYN1:	call	condin		; Tastatureingabe vorhanden?
+	jr	z,SYN2		; nein
+	cp	3		; Break?
+	jp	z,0
+	cp	esc		; ESC?
+	jp	z,0
+SYN2:	ld	c,1		; KC85: Staus aus Koppel-RAM lesen
+	call	status		; Vinculum Status abfragen
+	rrca
+	jr	c,SYN3		; keine Daten vorhanden
+	call	get		; vorhandene Daten abholen
+	ld	hl,option
+	bit	0,(hl)
+	call	nz,crtx		; und anzeigen, wenn konfiguriert
+	jr	sync
+	;
+SYN3:	rrca	
+	jr	c,sync		; noch nicht bereit, Daten zu schreiben
+	djnz	$		; kurze Zeit warten
+	dec	de
+	ld	a,d		; Zaehler abwarten
+	or	e
+	jr	nz,SYN1		; nochmals pruefen, ob doch noch Daten kommen
+	ld	bc,0		; KC85: Kontrolle mit ESC,ID durchfuehren
+	call	status		; Vinculum Status abfragen
+	and	3		; nur Bit 0 und 1 auswerten
+	cp	1		; alle Daten abgeholt und bereit zum schreiben?
+	jr	nz,sync		; nein !
+
+	ld	a,cr
+	call	put		; <cr> muss irgendwie <cr> zurueckgeben
+SYN4:	call	get
+	ret	c		; BRK oder TimeOut
+	cp	cr
+	jr	nz,SYN4
+
+	ld	a,'E'		; E <cr> muss E <cr> zurueckgeben
+	call	put
+	ld	a,cr
+	call	put
+SYN5:	call	get		; Daten holen
+	ret	c		; BRK oder TimeOut
+	cp	'E'
+	jr	nz,SYN5
+	call	get
+	ret	c		; BRK oder TimeOut
+	cp	cr
+	jr	nz,SYN5
+
+	ld	a,'e'		; e <cr> muss e <cr> zurueckgeben
+	call	put
+	ld	a,cr
+	call	put
+SYN6:	call	get		; Daten abholen
+	ret	c		; BRK oder TimeOut
+	cp	'e'
+	jr	nz,SYN6
+	call	get
+	ret	c		; BRK oder TimeOut
+	cp	cr
+	jr	nz,SYN6
+	ret
+
+; ----- Unterprogramme KC-spezifisch ------------------------------
+
+; Vinculum Status abfragen (alle 2048 Zyklen):
+;
+; PE:	BC	BC=xxxx x000 0000 0000b		Status mit ESC abfragen
+; PA:	A	Statusbyte von VDIP1
+;		Bit 0 = 0 wenn Eingabedaten vorhanden
+;		Bit 1 = 0 bereit fuer Datenausgabe
+
+STAT17:	ld	a,b
+	and	7
+	or	c
+	ld	a,4
+	call	z,drfunc
+	ld	a,(VSTAT)	; VDIP1-Status (von Treiber-Interrupt)
+	ret
+
+; Ab USB-Treiber Version 1.8 wird der Status direkt aus dem Stand des
+; Ringpuffers im Koppel-RAM ermittelt
+
+STAT18:	push	hl
+
+	LD	HL,OUTPTR	; KC-Pointer Puffer Zusatzausgabe	FFAA
+	LD	A,(HL)		; Zeiger lesen
+	INC	A		; Zeiger erhoehen
+	AND	1FH		; auf Puffergroesse 32 Zeichen begrenzen
+	INC	HL		; D004-Pointer				FFAB
+	CP	(HL)
+	LD	A,1		; Bit gesetzt, wenn Puffer voll ist
+	JR	Z,STAT2		; Puffer voll
+	DEC	A		; A=0, wenn Puffer aufnahmefaehig
+STAT2:	PUSH	AF		; Bit 0 vorbereitet fuer Bit 1
+
+	ld	hl,inptr	; KC-Pointer Puffer Zusatzeingabe	FFA4
+	ld	a,(hl)		; Zeiger lesen
+	inc	hl		; D004-Pointer				FFA5
+	cp	(hl)		; Eingabedaten im Puffer?
+	JR	Z,STAT3		; nein
+	POP	AF
+	OR	A		; CY=0 (Daten im Puffer vorhanden)
+	JR	STAT4
+	;
+STAT3:	POP	AF
+	SCF			; CY=1 (Keine Daten im Puffer)
+STAT4:	RLA			; 7 <- 0 (Bit 0 einschieben)
+	pop	hl
+	ret
+
+; Break-Taste(n) abfragen:
+; Falls BRK gedrueckt, dann restliche Daten abholen
+; PA:	CY=1	BRK- oder ESC-Taste gedrueckt
+; VR:	AF
+
+BRKKEY:	ld	a,(break)	; Tastatur abfragen?
+	or	a		; CY=0
+	ret	z		; nein
+	call	condin		; Tastatureingabe vorhanden?
+	jr	z,nobrk		; nein
+	cp	3		; Break?
+	jr	z,brk1
+	cp	esc		; ESC?
+	jr	z,brk1
+nobrk:	or	a		; CY=0
+	ret
+	;
+brk1:	call	eprint
+	db	cr,lf,'Break',0
+brk2:	call	status		; Status abfragen
+	rrca			; noch Daten vorhanden?
+	ret	c		; nein
+	call	get		; Daten abholen
+	jr	brk2
+
+; Eingabe von VDIP1 abholen (mit TimeOut):
+; PA:	A	Datenbyte
+;	CY=1	TimeOut
+; VR:	AF
+;
+KCGET:	push	bc
+	ld	bc,1		; Zeitkonstante
+kcget2:	call	STATUS		; Status abfragen
+	rrca			; Daten vorhanden?
+	jr	nc,kcget5	; ja, abholen
+	inc	bc
+	ld	a,b
+	or	c		; TimeOut?
+	jr	nz,kcget2
+kcget7:	call	eprint
+	db	'TimeOut Error',0
+	pop	bc
+	scf			; CY=1 (Fehler)
+	ret
+	;
+kcget5:	call	rin		; Zusatzeingabe (Koppeltreiber)
+	pop	bc
+	or	a		; CY=0 (OK)
+	ret
+
+; ----- Unterprogramme fuer CP/M-Systeme ---------------------------
+
+; Vinculum Status abfragen:
+;
+; PA:	A	Statusbyte von VDIP1
+;		Bit 0 = 0 wenn Eingabedaten vorhanden
+;		Bit 1 = 0 bereit fuer Datenausgabe
+
+CPMST:	push	bc
+	ld	bc,(PORT)	; C=PIO-Basisadresse
+	inc	c		; PIO-B
+	in	a,(c)		; Statusbyte lesen
+	pop	bc
+	ret
+
+; Eingabe von VDIP1 abholen (mit Break und TimeOut):
+; PA:	A	Datenbyte
+;	CY=1	TimeOut oder Break
+; VR:	AF
+
+CPMGET:	push	bc
+	ld	bc,0		; Zeitkonstante fuer TimeOut
+cpget2:	call	cpmst		; Status abfragen
+	rrca			; Daten vorhanden?
+	jr	nc,cpget5	; ja, abholen
+	inc	bc
+	ld	a,b
+	or	c		; TimeOut?
+	jr	nz,cpget2
+	jr	kcget7		; Abbruch mit TimeOut
+	;
+cpget5:	ld	bc,(PORT)	; C=PIO-Basisadresse
+	inc	c		; PIO-B
+	LD	A,0C0H		; RD# aktiv
+	OUT	(C),A
+	dec	c		; PIO-A
+	IN	B,(C)		; Daten holen
+	inc	c		; PIO-B
+	LD	A,0C4H		; RD# inaktiv
+	OUT	(C),A
+	LD	A,B		; Datenbyte
+	pop	bc
+	or	a		; CY=0 (OK)
+	ret
+
+; Ausgabe zu VDIP1 senden:
+; PE:	A	Datenbyte
+; VR:	-
+
+CPMPUT:
+if debug
+	CALL	AHEX		; ausgegebenen Befehl anzeigen
+endif
+	push	bc
+	ld	bc,(PORT)	; C = PIO-A
+	OUT	(C),A		; Datenbyte eintragen
+	push	af
+	inc	c		; PIO-B
+put1:	IN	A,(C)		; Status abfragen
+	RRCA
+	RRCA
+	JR	C,put1		; nicht bereit, warten!
+	LD	A,0CCH
+	OUT	(C),A		; WR aktiv
+	LD	A,0C4H
+	OUT	(C),A		; WR inaktiv
+	pop	af
+	pop	bc
+	RET
+
+; Kommando, gefolgt von Dateiname (fcb1) ausloesen:
+;
+; PE:	A	Kommando
+; PA:	CY=1	Fehler
+
+OUTNAM:	CALL	PUT		; Kommando
+	LD	A,' '
+	CALL	PUT
+	LD	HL,fcb1+1	; Dateiname
+	LD	B,11		; Laenge 8+3
+OPEN:	LD	A,(HL)
+	push	hl
+	and	7fh		; Bit 7 ruecksetzen
+	ld	hl,errchr
+	ld	c,5		; 5 verbotene Zeichen testen
+op1:	cp	(hl)
+	jr	nz,op2
+	ld	a,'_'		; -> konvertieren
+op2:	inc	hl
+	dec	c
+	jr	nz,op1
+	pop	hl
+	INC	HL
+	CP	21H		; Leerzeichen oder Steuerzeichen?
+	CALL	nc,PUT		; Dateiname
+	ld	a,b
+	cp	4
+	ld	a,'.'		; Trennzeichen vor Dateityp
+	call	z,PUT
+	DJNZ	OPEN
+	ret
+	;
+ERRCHR:	DB	'\/"|+'		; Zeichen die unter DOS verboten sind
+
+; Vinculum-Kommando ausfuehren:
+;
+;PA:	CY=1	Fehler (VDIP1-Fehler oder BRK oder TimeOut)
+;VR:	AF
+
+EXEC:	LD	A,CR	; Kommandoabschluss
+	CALL	PUT
+ex1:	CALL	GET	; Ergebnis holen
+	RET	C	; BRK oder TimeOut!
+	CP	'>'
+	JR	NZ,ERR
+	CALL	GET
+	RET	C
+	CP	CR	; OK, fertig?
+	RET	Z
+ERR:	CALL	CRTX	; Errorcode anzeigen
+	CALL	GET
+	JR	C,EX3
+	CP	CR	; Ende?
+	JR	NZ,ERR
+ex3:	CALL	eprint
+	db	'-Error',0
+	SCF		; Fehler!
+	RET
+
+if debug
+; 8-Bit-Wert hexadezimal in spitzen Klammern anzeigen
+; VR:	-
+AHEX:	PUSH	AF
+	 LD	A,'<'		; Einleitungszeichen
+	 CALL	cout
+	POP	AF
+	PUSH	AF
+	 RRCA			; Tetradentausch
+	 RRCA
+	 RRCA
+	 RRCA
+	 CALL	AHEX0		; H-Teil anzeigen
+	POP	AF
+	PUSH	AF
+	 CALL	AHEX0		; L-Teil anzeigen
+	 LD	A,'>'		; Ausleitungszeichen
+	 CALL	CRTX
+	POP	AF
+	RET
+endif
+; spezielle CRT-Routine:
+;
+; PE:	A	Zeichencode
+; VR:	-
+
+CRTX:	push	af
+	and	7fh		; Bit 7 abschneiden
+	cp	20h
+	jr	nc,crt1		; darstellbares Zeichen!
+	cp	cr
+	jr	nz,crt2		; nur CR zulaessig
+	call	cout
+	ld	a,lf		; mit LF ergaenzen
+crt1:	call	cout
+crt2:	pop	af
+	ret
+
+; Anzeige UTools-Programmversion:
+
+version:
+	call	eprint
+	db	' UTools v',0
+	ld	a,(vers)	; Versionsnummer BCD
+	call	verbcd
+	ld	a,(KC85)
+	inc	a		; FFH?
+	jr	z,nokc		; ja, anderes CP/M-System
+	CP	4		; KC85 CP/M im Grundgeraet?
+	jr	C,cpm		; nein, D004 oder D008
+	call	eprint
+	db	' KC85/'	; KC85-Type wird bei Programmstart
+D34:	DB	'?',0		; hier eingetragen
+	JR	KC34
+	;
+cpm:	call	eprint
+;	DB	' KC85+D004   mit 4MHz',0
+;	DB	' KC85+D008.1 mit 8MHz',0
+;	DB	' KC85+D008.2 mit 16MHz',0
+;	DB	' KC85/4  USB-PIO auf 2CH',0
+;	DB	' CP/M mit 1MHz  USB-PIO auf 2CH',0
+	DB	' KC85+D00'
+D00:	DB	'4'
+D01:	DB	'  ',0
+	jr	PFREQ
+	;
+NOKC:	call	eprint
+	DB	' CP/M'
+PFREQ:	call	eprint
+	db	' mit ',0
+	ld	HL,(takt)
+	LD	H,0
+	call	phlfdc		; Taktfrequenz
+	call	eprint
+	db	'MHz'0
+	ld	a,(KC85)
+	cp	3
+	jr	c,nopio		; Bei D004 und D008 Portadresse nicht anzeigen
+KC34:	call	eprint
+	db	': USB-PIO auf ',0
+	LD	A,(PORT)
+	call	pa2hc		; hexadezimal anzeigen
+	call	eprint
+	db	'H',0
+nopio:	call	eprint
+	DB	cr,lf,' (c) 2008-2024, M. Leubner',cr,lf,0
+	ret
+;
+; Versionsnummer x.y anzeigen
+; PE:	A	BCD-Wert
+; VR:	-
+;
+VERBCD:	push	af
+	rra
+	rra
+	rra
+	rra
+	call	ahex0		; hoeherwertigen Teil
+	ld	a,'.'		; Trennzeichen
+	call	cout
+	pop	af		; niederwertigen Teil
+AHEX0:	PUSH	AF
+	AND	0FH		; Maske
+	ADD	A,90H		; uebliche
+	DAA			; Routine
+	ADC	A,40H		; fuer die
+	DAA			; HEX-Ausgabe
+	CALL	cout
+	POP	AF
+	RET
+;
+; Treiberumleitung deaktivieren (vor EXIT):
+; V1.4: vorher noch alle anliegenden Daten abholen
+;
+deinit:	LD	A,(TAKT)	; CPU-Taktfrequenz in MHz
+	LD	E,A		; E = Zaehlerwert fuer Zeitschleife
+deini2:	ld	bc,1		; KC85: Status aus Koppel-RAM lesen
+	call	status		; Vinculum Status abfragen
+	rrca
+	jr	c,deini3	; keine Daten vorhanden
+	call	get		; vorhandene Daten abholen
+	jr	deinit
+	;
+deini3:	djnz	$		; kurze Zeit warten
+	dec	e		; Zaehler abwarten
+	jr	nz,deini2	; nochmals pruefen, ob doch noch Daten kommen
+	ld	a,(KC85)
+	cp	3		; KC85-System mit D004 oder D008?
+	ret	nc		; nein, fertig
+	djnz	$		; kurze Zeit warten
+	ld	bc,0		; KC85: Kontrolle mit ESC,ID durchfuehren
+	call	status		; Vinculum Status abfragen
+	and	3		; nur Bit 0 und 1 auswerten
+	cp	1		; alle Daten abgeholt und bereit zum schreiben?
+	jr	nz,deinit	; nein !
+	ld	a,3		; Beim KC85 noch Umleitung Koppeltreiber AUS
+
+; Treiberfunktion aufrufen:
+; PE:	A	Nummer der Funktion
+; PA:	A	Rueckgabewert
+
+DRFUNC:	push	af
+	LD	A,0FFH
+	LD	(MEMANF),A	; MEMANF setzen
+	CALL	EPRINT
+	DB	ESC,'o',ID,0	; Aufruf der Treiberfunktion
+	pop	af
+	call	cout		; Funktionsnummer
+	xor	a
+	call	cout		; keine weiteren Daten
+wait:	LD	A,(MEMANF)
+	CP	0FFH
+	JR	Z,wait		; warten bis Wert aktuell ist
+	ret
+
+PROZENT	macro
+; Fortschrittsanzeige in Prozent der Dateigroesse berechnen und anzeigen
+;
+; PE:	(filesize0)	Gesamtgroesse
+;	(filesize)	Laufvariable (Rueckwartszaehler)
+;
+; VR:	alle
+
+PROZ:	ld	a,(option)	; Fortschritt wie anzeigen?
+	rlca
+	jr	nc,PROZ0	; Fortschrittsanzeige in Prozent
+	ld	a,'#'
+	jp	cout		; Zeichen anzeigen fuer einen Datenblock
+	;
+PROZ0:	LD	IX,FILESIZE0	; Gesamtdateigroesse
+	ld	de,(filesize)
+	ld	bc,(filesize+2)	; BCDE = restliche Anzahl
+	ld	a,(ix)
+	sub	e
+	ld	e,a
+	ld	a,(ix+1)
+	sbc	a,d
+	ld	d,a
+	ld	a,(ix+2)
+	sbc	a,c
+	ld	c,a
+	ld	a,(ix+3)
+	sbc	a,b
+	ld	b,a		; BCDE = abgearbeitete Groesse
+	ld	a,cr
+	call	cout		; Cursor an Zeilenanfang setzen
+	LD	A,(IX)
+	OR	(IX+1)
+	OR	(IX+2)
+	OR	(IX+3)
+	JR	Z,PROZ1		; Dateigroesse = 0 -> 100,0%
+	xor	a
+	ex	af,af'		; fuehrende Nullen ausblenden
+	call	ZIFFER		; Hunderter anzeigen
+	call	mul10		; BCDE * 10
+	call	ZIFFER		; Zehner anzeigen
+	call	mul10		; BCDE * 100
+	ld	a,'0'
+	ex	af,af'
+	call	ZIFFER		; Einer anzeigen
+	ld	a,','
+	call	cout		; Trennzeichen
+	call	mul10		; BCDE * 1000
+	call	ZIFFER		; Zehntel anzeigen
+	ld	a,'%'
+	jp	cout
+PROZ1:	call	eprint
+	db	'100,0%',0
+	ret
+
+; 32-Bit-Zahl in BCDE mit 10 multiplizieren
+;
+; PE:	BCDE	32-Bit-Zahl
+; PA:	BCDE	Ergebnis
+;
+mul10:	SLA	E
+	RL	D
+	RL	C
+	RL	B	; *2
+	push	bc
+	push	de
+	SLA	E
+	RL	D
+	RL	C
+	RL	B	; *4
+	SLA	E
+	RL	D
+	RL	C
+	RL	B	; *8
+	POP	HL
+	ADD	HL,DE
+	EX	DE,HL
+	POP	HL
+	ADC	HL,BC
+	LD	B,H
+	LD	C,L	; BCDE*10 (8+2)
+	ret
+
+; Verhaeltnis zweier 32-Bit-Zahlen BCD berechnen und anzeigen
+; (eine Stelle fuer Prozentanzeige)
+;
+; PE:	BCDE	32-Bit-Ziffer
+;	IX	Wertigkeit (Gesamtdateigroesse)
+;	A'	'0' wenn Ausgabe laeuft
+; PA:	BCDE	Rest, der bei der Teilung uebrig bleibt
+
+ZIFFER:	LD	L,99H		; Zaehler
+ZIFF1:	LD	A,L
+	ADD	A,1		; HL = HL+1 (BCD)
+	DAA
+	LD	L,A
+
+	LD	A,E
+	SUB	(IX)		; E = niederwertigstes Byte
+	LD	E,A
+	LD	A,D
+	SBC	A,(IX+1)	; D = mittleres Byte
+	LD	D,A
+	LD	A,C
+	SBC	A,(IX+2)	; C = hoeherwertiges Byte
+	LD	C,A
+	LD	A,B
+	SBC	A,(IX+3)	; B = hoechstwertiges Byte
+	LD	B,A
+	JR	NC,ZIFF1	; nochmal enthalten
+
+	LD	A,E
+	ADD	A,(IX)		; letzten Teil wieder addieren
+	LD	E,A
+	LD	A,D
+	ADC	A,(IX+1)
+	LD	D,A
+	LD	A,C
+	ADC	A,(IX+2)
+	LD	C,A
+	LD	A,B
+	ADC	A,(IX+3)
+	LD	B,A
+
+	LD	A,L
+	AND	0FH		; Zahler = null?
+	JR	NZ,ZIFF2	; nein, sofort anzeigen
+	EX	AF,AF'
+	PUSH	AF
+	EX	AF,AF'
+	POP	AF
+	OR	A		; laeuft Ausgabe schon?
+	RET	Z		; nein, keine fuehrende Nullen!
+ZIFF2:	EX	AF,AF'
+	LD	A,'0'		; Ausgabe laeuft
+	EX	AF,AF'
+	OR	'0'		; Ziffer
+	JP	COUT		; anzeigen
+	endm
+
+; BIOS-Routinen:
+
+SELDSK:	LD	A,9		; Laufwerk waehlen
+	DB	21H
+SETTRK:	LD	A,10		; Spur waehlen
+	DB	21H
+SETSEC:	LD	A,11		; Sektor waehlen
+	DB	21H
+DMASET:	LD	A,12		; DMA-Puffer setzen
+	DB	21H
+RDBIOS:	LD	A,13		; Sektor lesen
+	DB	21H
+WRBIOS:	LD	A,14		; Sektor schreiben
+	DB	21H
+SECTRAN: LD	A,16		; Sektornummer umrechnen
+
+; Aufruf einer BIOS-Routine:
+; PE:	A	Nr. der BIOS-Routine
+;	 0	BOOT	Kaltstart
+;	 1	WBOOT	Warmstart
+;	 2	CONST	Console-Status   PA: A=0FFH Zeichen bereit, sonst A=0
+;	 3	CONIN	Console-Eingabe  PA: Zeichen in A
+;	 4	CONOUT	Console-Ausgabe  PE: Zeichen in C
+;	 5	LIST	Drucker-Ausgabe  PE: Zeichen in C
+;	 6	PUNCH	Zusatz-Ausgabe   PE: Zeichen in C
+;	 7	READER	Zusatz-Eingabe   PA: Zeichen in A
+;	 8	HOME	Spur 0 einstellen
+;	 9	SELDSK	Laufwerk waehlen PE: C=Disknummer (A=0, usw.)
+;					 PA: HL=DPH-Adresse
+;	10	SETTRK	Spur waehlen     PE: BC=Spurnummer
+;	11	SETSEC	Sektor waehlen   PE: BC=Sektornummer
+;	12	SETDMA	Pufferadr.setzen PE: BD=DMA-Adresse
+;	13	READ	Sektor lesen	 PA: A=0 wenn OK, A=1 bei Fehler
+;	14	WRITE	Sektor schreiben PA: A=0 wenn OK, A=1 bei Fehler
+;	15	LISTST	List-Status	 PA: A=0FFH wenn bereit, sonst A=0
+;	16	SECTRAN	Sektornummer umrechnen
+;					 PE: BC=Sektornummer, DE=Umrechentabelle
+;					 PA: HL=umgewandelte phys. Sektornummer
+; ab hier KC-spezifisch:
+;	17	RTCIO	RTC-Uhr lesen/einstellen
+;	18	PUNST	Status Zusatz-Ausgabe PUN:
+;	19	RDRST	Status Zusatz-Eingabe RDR:
+;	20	DUMMY	reserviert
+
+BIOS:	PUSH	HL		; HL sichern
+	LD	L,A		; Nr. temporaer in L sichern
+	ADD	A,A		; * 2
+	ADD	A,L		; * 3
+	LD	HL,(1)		; WBOOT-Adresse
+	LD	L,A		; HL = Adresse der BIOS-Routine
+	EX	(SP),HL		; HL regenerieren und Sprungadresse auf Stack
+	RET			; Absprung zu BIOS-Routine
+
+;	end of include

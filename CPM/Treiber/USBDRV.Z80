@@ -1,0 +1,465 @@
+;------------------------------------------------------------------------------
+;
+;	UTools Version 1.8 (von M. Leubner)
+;
+; Hilfsprogramme zur Arbeit mit USB-Sticks unter CP/M
+;
+;	DRV-Treiber fuer VDIP1 oder VDIP2 an Modul M052
+;	mit Status-Abfrage per ESC-Befehl
+;	(und Interrupt -> Koppel-RAM)
+;
+; V1.0 (16.03.2008): zyklischer CTC-Interrupt
+;
+; V1.1 (20.04.2008): PIO-Interrupt - modifizierter Schaltplan!
+;	20.07.2008 : Fehlerkorrektur falls Modul nicht vorhanden
+;
+; V1.2 (31.01.2009): Bit 6+7 von PIO-Port B auf "1" gesetzt
+;		     damit kein Problem an #RESET & #PROG
+;		   - Version fuer M001 und M052 anpassbar
+;
+; V1.3 (18.10.2009): Extra-Treiber M052.DRV um Modul zu schalten,
+;		   - M001 nicht mehr unterstuetzt
+;
+; V1.4 (01.03.2019): mit USB-Tastatur fuer VNC2 ueber M052-Interrupt
+;
+; V1.5 (08.03.2019): mit USB-Tastatur fuer VNC2 ueber, Interrupt im Treiber
+;		     mit Zwischenpuffer fuer FIFO-Daten
+;	16.03.2019 : FIFO-Daten bei INIT abholen, damit FIFO-Puffer im VNC leer
+;		     wird und Interrupt auch bis CAOS 4.6 aktiv wird
+;	17.03.2019 : Bei Deinitialisierung Modul nicht per CALL C020H neu
+;		     initialisieren - das macht spaeter DEP 3.4 oder RESET
+;
+; V1.6 (06.04.2019): Original-Koppeltreiber jedes Mal bei UMEIN merken
+;
+; V1.7 (02.05.2021): Reihenfolge der PIO-Initialisierung geaendert, damit kein
+;		     unbeabsichtigter RESET ausgeloest wird.
+;
+; V1.8 (19.04.2022): Zusatzeingabe: Interrupt schreibt gleich in den Puffer des
+;		     Koppel-RAM ohne auf die Anforderung vom BIOS zu warten
+;	21.04.2022 : Das Prinzip funktioniert nur mit ZAS-Version fuer
+;		     "Koppeltreiber neu", denn nur bei diesem wird bei Rueckkehr
+;		     mit CY=1 kein Zeichen verarbeitet. Bei Eingabeanforderung
+;		     muss jedoch noch geprueft werden, ob noch neue Daten
+;		     abgeholt werden muessen. GET prueft dies nun nur noch,
+;		     uebergibt die Daten aber dennoch direkt in den Koppel-RAM
+;	14.08.2022 : Kontrolle, ob passende ZAS-Version ab 1.7 vorhanden ist.
+;		     Falls nicht, laesst sich der Treiber nicht aktivieren
+;
+; Funktion der USB-Tastatur: Wenn ein M052 mit Software 2.7 oder hoeher steckt,
+; dann wird INIT vom M052 aufgerufen und anschliessend FILE-Mode eingestellt.
+; Danach sollte GET und PUT ganz normal funktionieren und der Tastaturinterrupt
+; in das M052 in den EEPROM laufen, so wie unter CAOS auch.
+; Voraussetzung: kein Programm ueberschreibt 00AE bis 00EAH im System-RAM
+; (Die Bootmeldungen vom VNC2 werden dabei im nicht sichtbaren Bild angezeigt)
+;
+; Ist eine aeltere M052-Software im EEPROM, dann wird das Modul wie bisher
+; ohne Interrupt initialisiert.
+;
+; USBDRV.Z80 -> USB.DRV       08.01.2008 - 08.11.2022
+;------------------------------------------------------------------------------
+; Uebersetzung:		SLRZ80 USBDRV/M  oder ASM USBDRV=USBDRV.Z80
+;			LINK131 USB.DRV=USBDRV.REL [OP,NR]
+;			ERA USBDRV.REL
+;------------------------------------------------------------------------------
+;
+; Treiber-Funktionen:	ESC,o,ID,0,0	Initialisierung
+;			ESC,o,ID,1,0	Deinitialisierung
+;			ESC,o,ID,2,0	Umleitung Koppeltreiber ein
+;			ESC,o,ID,3,0	Umleitung Koppeltreiber aus
+;			ESC,o,ID,4,0	Statusabfrage
+
+	.Z80		; CPU-Type
+
+; Makros:
+PRMSG   MACRO   MSG,N       
+	.PRINTX *MSG,N*
+	ENDM
+
+; Allgemeine Vereinbarungen:
+CR	EQU	0DH	; Kommandoabschluss
+IVEK	EQU	0D0H	; Interrupt-Vektor (PIO Port B)
+AIBUFF	EQU	060F3H	; 32 Byte Ringpuffer Zusatzeingabe
+INPTR4	EQU	0A4F3H	; KC-Pointer fuer Ringpuffer Zusatzeingabe
+INPTR5	EQU	0A5F3H	; D004-Pointer fuer Ringpuffer Zusatzeingabe
+AIANF	EQU	0ADF3H	; AIANF ist <> 0 wenn Zusatzeingabe angefordert wurde
+STATUS	EQU	0C0F3H	; FFC0H im Koppel-RAM
+		; Bit 0 = RXF#	0 = Empfangsdaten verfuegber
+		; Bit 1 = TXE#	0 = Bereit zum Daten schreiben
+MODE	EQU	11H	; Bit 1,0: Terminal-Betriebsart
+			;	0 = normal
+			;	1 = Steuerzeichen darstellen
+			;	2 = alle Zeichen hexadezimal anzeigen
+			; Bit 3,2: Interruptmode
+			;	0 = CAOS (FIFO-Daten loeschen)
+			;	4 = Filemode (FIFO-Daten behalten)
+			;	8 = Terminal (FIFO-Daten anzeigen)
+CURSO	EQU	0B7A0H	; Cursorposition
+
+; CAOS-Systemprogramme:
+PV1	EQU	0F003H	; Sprungverteiler
+MODU	EQU	26H
+INIEA	EQU	43H
+INIME	EQU	44H
+
+; Portadressen der Vinculum-PIO im M052:
+PIO52A	EQU	2Ch	; Daten A
+PIO52B	EQU	2Dh	; Daten B
+PIO52AS	EQU	2Eh	; Steuer A
+PIO52BS	EQU	2Fh	; Steuer B
+
+; Steuerbyte-Kombinationen:	; Grundstellung
+ST0	EQU	11110100b	; F4H: PROG#=1, RESET#=1, DATAREQ#=1, RD&WR inaktiv
+ST_RES	EQU	10110100b	; B4H:          RESET#=0
+ST_RD	EQU	11110000b	; F0H:		RD#=0
+ST_WR	EQU	11111100b	; FCH:		WR=1
+
+;***************************************
+; DRV-Header:
+
+TOP:	JR	START			; Programmverteiler
+ID:	DB	26			; ID fuer USB-Treiber
+	DB	18H			; Version 1.8
+	DB	00H or High (SIZE-1)	; Speicherbedarf
+USE:	DB	0			; USE-Counter
+SUB1:	DB	28			; Treiber M052.DRV erforderlich
+ADR1:	DB	10H			; Version 1.0 / dann Adresse
+	DB	0			; keine weiteren Treiber erforderlich
+	DB	'M052USB',0		; Name des Treibers
+
+; Sprungverteiler Koppeltreiber (10 Byte):
+
+KOP:	RET		; Initialisierung (nicht genutzt)
+	NOP		; hier koennten noch Daten liegen!
+	JR	JPUT	; Byte-Ausgabe
+	JP	GET	; Byte-Eingabe
+JPUT:	JP	PUT
+ksize	equ	$-KOP	; Anzahl Bytes fuer Umschaltung
+
+MEM:	DS	ksize,0	; Ablage der Ursprungsdaten
+
+; Bei Erstinitialisierung des PIO-Port-B muss sichergestellt werden, dass der
+; RESET-Ausgang (Bit 6) High bleibt. Im Einschaltzustand sind die PIO-Ports
+; hochohmig und werden ueber Pull-Up-Widerstaende auf High gezogen, deshalb:
+; 1. PIO-Port A initialisieren, und PIO damit aus dem RESET-Zustand holen
+;    (so wird auch das Ausgaberegister von Port B beschreibbar)
+; 2. Port B Datenwort einschreiben
+; 3. Betriebsart fuer Port B einstellen um das Datenwort zu uebernehmen.
+;
+; Initialisierungsdaten M052-PIO (USB) - fuer CAOS+Terminal mit Interrupt:
+
+DATA:	DB	3		; 3 Ports
+
+	DB	PIO52AS		; Steuerport A
+	 DB	2
+	  DB	8FH		; bidirektional
+	  DB	7		; kein INT
+
+	DB	PIO52B		; Datenport B
+	 DB	1
+	  DB	ST0		; Grundstellung (PROG#=1, RESET#=1, DATAREQ#=1)
+
+	DB	PIO52BS		; Steuerport B
+	 DB	5		; Anzahl Steuerbytes
+	  DB	0CFH		; Bitbetrieb
+	  DB	00100011b	; I/O-Pins festlegen
+		; Bit 0 = RXF#		Eingang	Low = Empfangsdaten verfuegber
+		; Bit 1 = TXE#		Eingang	Low = Bereit zum Daten schreiben
+		; Bit 2 = RD#		Ausgang	Lese-Impuls Low-aktiv
+		; Bit 3 = WR		Ausgang	Schreibimpuls High-aktiv
+		; Bit 4 = DATAREQ#	Ausgang (Takt an Tastatur)
+		; Bit 5 = DATAACK#	Eingang (Daten von Tastatur)
+		; Bit 6 = RESET#	Ausgang	Low loest Ruecksetzen aus
+		; Bit 7 = PROG#		Ausgang Low schaltet in Programmiermode
+	  DB	IVEK		; Int.-Vektor
+	  DB	97h		; EI, OR, Low, Maske folgt
+	  DB	11011111b	; Maske: Bit 5 (Tastatur) loest Interrupt aus
+
+; Sprungverteiler:
+
+START:	OR	A
+	JR	Z,INIT		; A=0 Initialisierung
+	DEC	A
+	JR	Z,DINIT		; A=1 Deinitialisierung
+	DEC	A
+	JP	Z,UMEIN		; A=2 Umleitung Koppeltreiber ein
+	DEC	A
+	JP	Z,UMAUS		; A=3 Umleitung Koppeltreiber aus
+	DEC	A
+	JP	Z,STAT		; A=4 Statusabfrage
+	RET
+JPHL:	JP	(HL)		; Sprungfunktion fuer Treiberaufruf
+
+; Funktion A=0 Initialisierung:
+; PA:	A=0	OK
+;	A=0FEH	Modul M052 oder M052.DRV nicht gefunden oder ZAS-Version falsch
+
+INIT:	LD	A,(USE)
+	OR	A		; bereits initialisiert?
+	JP	NZ,INIT1	; ja, dann nur USE erhoehen
+
+; 14.08.2022:
+; Kontrolle, ob ZAS 1.7 oder hoeher laeuft (neuer Koppeltreiber)
+
+	LD	BC,0B9F3H	; =FFB9
+	IN	A,(C)		; ZAS-Version (wird von ZAS dort eingetragen)
+	CP	17H		; Version ab 1.7 vorhanden?
+	LD	A,0FEH		; Fehlercode
+	JP	C,IERR		; Versionsnummer zu gering
+
+; Modulnutzung des M052 anmelden (M052.DRV schaltet PIO's ein):
+
+	LD	HL,(SUB1)	; Subtreiber 1
+	LD	A,L		; ID von M052.DRV
+	LD	L,2		; Zeiger auf ID im Treiber M052.DRV
+	CP	(HL)		; Kontrolle: SUB-Treiber vorhanden?
+	LD	A,0FEH		; Fehlercode zurueckgeben
+	JP	NZ,IERR		; nein - Abbruch der Initialisierung!
+	XOR	A		; Funktion 0 = Initialisierung
+	LD	L,A		; HL=Sprungadresse
+	CALL	JPHL		; Subtreiber initialisieren
+	OR	A		; erfolgreich initialisiert?
+	JP	NZ,IERR		; nein, Treiber nicht arbeitsfaehig
+				; A: Rueckgabe Fehlercode Subtreiber
+
+; Interrupttabelle eintragen:
+
+	LD	A,I
+	LD	H,A
+	LD	L,IVEK
+	LD	DE,ISR
+	LD	(HL),E
+	INC	HL		; ISR eintragen
+	LD	(HL),D
+
+; PIO initialisieren:
+ 
+	LD	HL,DATA		; INIT-Daten
+	LD	D,(HL)		; Anzahl Ports
+	INC	HL
+	CALL	PV1		; PIO initialisieren
+	DB	INIME		; Interrupt hier schon aktiv
+
+; CP/M-Tastaturtabelle aktivieren
+
+	LD	A,'R'		; Rollen
+	CALL	PUT
+	LD	A,'1'		; EIN
+	CALL	PUT
+	LD	A,CR		; Kommandoabschluss
+	CALL	PUT
+
+; VNC mit Ringpuffer synchronisieren:
+; hier Zeitschleife einbauen fuer VNC1 !!!
+
+SYNC1:	IN	A,(PIO52B)	; Status abfragen
+	RRCA			; noch Daten vorhanden?
+	jr	c,sync2		; nein (bereits von Interrupt verarbeitet)
+	LD	A,ST_RD		; RD#=0 (aktiv)
+	OUT	(PIO52B),A
+	LD	A,ST0		; RD#=1 (inaktiv)
+	OUT	(PIO52B),A
+	jr	sync1
+	;
+sync2:	; Ringpufferzeiger ruecksetzen
+	LD	BC,INPTR5	; D004-Pointer
+	IN	A,(C)		; lesen
+	DEC	B		; KC-Pointer
+	OUT	(C),A		; auf den gleichen Wert setzen (Puffer leer)
+	LD	A,1		; Puffer leer
+	LD	B,High(STATUS)	; Statusbyte im Koppel-RAM
+	OUT	(C),A		; an CP/M melden
+
+; Einsprungtabelle vom Original-Koppeltreiber merken:
+
+INIT1:	LD	HL,USE
+	INC	(HL)		; eigenen USE-Counter erhoehen
+	XOR	A		; OK melden
+	ret
+
+; Funktion A=1 Deinitialisierung:
+; PA:	A=0	Treiber wurde geloescht
+;	A>0	verbleibender USE-Counter
+
+DINIT:	LD	HL,USE
+	DEC	(HL)		; USE-Counter verringern
+	LD	A,(HL)
+	RET	NZ		; weitere Abhaengigkeiten vorhanden
+	LD	A,3		; PIO-Interrupt AUS
+	OUT	(PIO52BS),A
+	call	umaus		; Ursprungs-Koppeltreiber regenerieren
+
+; Modulnutzung des M052 abmelden:
+
+	LD	HL,(SUB1)	; benutzter Subtreiber 1
+	LD	A,L		; ID von M052.DRV
+	LD	L,2		; Zeiger auf ID im Treiber M052.DRV
+	CP	(HL)		; SUB-Treiber noch vorhanden?
+	LD	A,1		; Funktion 1 = Deinitialisierung
+	LD	L,0		; HL=Sprungadresse
+	CALL	Z,JPHL		; Subtreiber deinitialisieren
+	XOR	A		; geloescht melden
+IERR:	LD	HL,ID
+	LD	(HL),0		; eigenen ID-Code loeschen
+	RET
+
+; Funktion A=2 Umleitung Koppeltreiber aktivieren:
+
+UMEIN:	ld	hl,0380h	; Speicherplatz Koppeltreiber
+	ld	de,mem		; Zwischenspeicher
+	ld	bc,ksize
+	ldir			; Originaldaten merken
+	ld	hl,kop		; USB-Koppeltreiber
+	jr	UM
+
+; Funktion A=3 Umleitung Koppeltreiber deaktivieren:
+
+UMAUS:	LD	BC,AIANF	; 0ADF3H
+	XOR	A		; eventuell noach anstehende Anforderung
+	OUT	(C),A		; quittieren
+	ld	hl,mem		; Original-Koppeltreiber
+UM:	ld	de,0380h
+	ld	bc,ksize
+	ldir			; Koppeltreiber umladen
+	RET
+
+; Ausgabe Datenbyte (Koppeltreiber):
+; PE:	A	Datenbyte
+; VR:	AF
+
+PUT:	OUT	(PIO52A),A	; Datenbyte ausgeben
+PUTW:	IN	A,(PIO52B)
+	RRCA
+	RRCA
+	JR	C,PUTW		; nicht bereit, warten!
+	LD	A,ST_WR		; WR=1 (aktiv)
+	OUT	(PIO52B),A
+	LD	A,ST0		; WR=0 (inaktiv)
+	OUT	(PIO52B),A
+
+; Funktion A=4 Statusabfrage:
+; PA:	A	Statusbyte
+; VR:	AF
+
+STAT:	PUSH	BC
+	LD	BC,INPTR5	; 0A5F3H
+	IN	A,(C)		; INPTR+5 (D004-Pointer)
+	DEC	B
+	IN	B,(C)		; INPTR+4 (KC-Pointer))
+	CP	B
+	LD	A,1		; A=1 fuer Puffer leer
+	JR	Z,STAT1		; Puffer ist leer
+	DEC	A		; A=0 fuer Daten im Puffer
+STAT1:	LD	B,High(STATUS)	; 0C0F3H
+	OUT	(C),A		; in Koppel-RAM schreiben
+	POP	BC
+	RET
+
+; Eingabe Datenbyte (Koppeltreiber), Aufruf, wenn AIANF gesetzt ist:
+; Datenbyte wird aus Puffer geholt
+; PA:	A	Datenbyte
+;	CY=1	keine Daten empfangen (neuer Koppeltreiber)
+; VR:	AF
+
+GET:	PUSH	BC
+	LD	BC,INPTR5	; 0A5F3H
+	IN	A,(C)		; INPTR+5 (D004-Pointer)
+	DEC	B
+	IN	B,(C)		; INPTR+4 (KC-Pointer))
+	CP	B		; Puffer leer?
+	DI			; Interrupt sperren, damit dieser im folgenden
+				; UP nicht dazwischenfunkt!
+	CALL	Z,FIFO		; Datenabholung aus FIFO neu anschupsen
+	EI			; Jetzt Interrupt wieder freigeben
+GET1:	POP	BC
+	SCF			; als fehlerhaft melden
+	RET			; V1.8: GET liefert keine Daten an ZAS!
+; das funktioniert aber nur bei ZAS ab V1.7 fuer den neuen Koppeltreiber !!!
+
+; ISR fuer Tastatur und FIFO-Daten ----------
+; Unterscheidung ob Interrupt von FIFO oder Tastatur
+;	-> Abfrage der seriellen Tastatur-Signale
+;	   dann Tastencode seriell abholen und aktivieren falls nicht 0
+;	-> FIFO-Daten abholen und in Ringpuffer eintragen
+
+ISR:	PUSH	BC
+	PUSH	AF
+	IN	A,(PIO52B)
+	BIT	5,A		; Tastencode anstehend?
+	JR	NZ,TLOOP	; nein, FIFO noch fragen
+
+; Tastatur-Interrupt
+; wir starten mit C=80h, nach 8x RR C ist CY=1 => 8 Datenbit eingelesen
+	LD	C,80h
+LOOP:	RES	4,A		; DATAREQ#=0			 8 Takte
+	OUT	(PIO52B),A	; Quittierung			11 Takte
+	LD	B,30		; Wait 0,56 Mikrosekunden*T	 4 Takte
+	DJNZ	$		; 1. Warteschleife		13/8 Takte
+	IN	A,(PIO52B)	; Datenbit holen		11 Takte
+	RLCA			;				 4 Takte
+	RLCA			;				 4 Takte
+	RLCA			; Datenbit jetzt in CY		 4 Takte
+	RR	C		; CY -> (7-0) in C-Register	 8 Takte
+	IN	A,(PIO52B)	; 				11 Takte
+	SET	4,A		; DATAREQ#=1			 8 Takte
+	OUT	(PIO52B),A	; naechstes Bit anfordern	11 Takte
+	JR	NC,LOOP		; bis 8 Bit eingelesen sind	13/8 Takte
+				; nach 8 Bit kommt CY=1 von RR C
+	LD	(IX+13),C	; Tastencode eintragen
+	JR	Z,TLOOP		; Code=0 (Taste losgelassen)
+				; Z-Flag wird vom letzten RR C gesetzt
+	SET	0,(IX+8)	; alles andere gueltig machen
+
+; FIFO-Interrupt: Daten abholen
+
+TLOOP:	CALL	FIFO		; Daten abholen -> Koppel-RAM
+	POP	AF
+	POP	BC
+	EI
+	RETI
+
+; Daten abholen in Schleife bis Puffer voll ist oder keine Daten mehr anliegen
+
+FIFO:	PUSH	DE
+TL1:	IN	A,(PIO52B)
+	BIT	0,A		; FIFO-Daten anstehend?
+	JR	NZ,IRET		; nein, fertig
+	LD	BC,INPTR5	; 0A5F3H
+	IN	E,(C)		; INPTR+5 (D004-Pointer)
+	DEC	B
+	IN	D,(C)		; INPTR+4 (KC-Pointer))
+	LD	A,D
+	INC	A		; KC-Pointer erhoehen
+	AND	1FH		; auf 32 Byte begrenzen
+	CP	E		; noch Platz im Ringpuffer?
+	JR	Z,IRET		; Puffer fuer Zusatzeingabe voll
+	LD	E,A		; KC-Pointer (neuer Wert)
+	LD	A,High(AIBUFF)	; AIBUFF (Ringpuffer im Koppel-RAM)
+	ADD	A,D		; KC-Pointer (alter Wert)
+	LD	B,A		; BC = Portadresse zu Ringpuffer
+
+	LD	A,ST_RD		; RD#=0 (aktiv)
+	OUT	(PIO52B),A
+	IN	A,(PIO52A)	; Datenbyte holen
+	LD	D,A		; in D merken
+	LD	A,ST0		; RD#=1 (inaktiv)
+	OUT	(PIO52B),A
+
+	OUT	(C),D		; empfangenes Zeichen -> Puffer Zusatzeingabe
+	LD	B,High(INPTR4)	; INPTR+4 (KC-Pointer)
+	OUT	(C),E		; Quittung Zusatzeingabe, KC-Pointer neu setzen
+	JR	TL1		; Kontrolle, ob weitere Daten anliegen
+	;
+IRET:	POP	DE
+	RET
+
+;***************************************
+SIZE	EQU	$-TOP	; Speicherbedarf
+;*** Codeende **************************
+
+IF2
+	.PRINTX "USB-Treiber 1.8 fuer M052"
+	.RADIX  16
+	PRMSG   <Speicherbedarf=>,%SIZE
+	.RADIX  10
+ENDIF
+	END

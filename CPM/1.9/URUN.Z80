@@ -1,0 +1,649 @@
+;-----------------------------------------------------
+;
+;	UTools Version 1.9 (von M. Leubner)
+;
+; Hilfsprogramme zur Arbeit mit USB-Sticks unter CP/M
+;	(nach einer Idee von Rolf Weidlich 07/2021)
+;
+;	Datei von USB-Stick direkt starten
+;
+; URUN.Z80 -> URUN.COM	02.04.2022 - 19.11.2024
+;-----------------------------------------------------
+; Uebersetzung:		SLRZ80 URUN/R
+;			SLRNK URUN/N,/V,/A:100,URUN,/E
+;			ERA URUN.REL
+;-----------------------------------------------------
+
+	.Z80
+	CSEG
+
+	JP	START		; eigentlicher Programstart
+	DB	'Z3ENV'		; ENV von Z-System
+	DB	1		; Typ-1
+ENVPTR:	DW	0		; Zeiger zu ENV-Beschreibung
+	DW	100h		; ORG-Adresse
+
+; Konfigurationsdatenbereich:
+
+	DB	'USB19   '	; Name der CFG-Datei
+VERS:	DB	VER		; Versionsnummer
+OPTION:	DB	00000000b	; Optionen (Voreinstellung):
+;	Bit 0	       ^--------- Anzeige der noch vorhandenen Daten bei Start
+;	Bit 1	      ^---------- Verzeichnis sortieren?
+;	Bit 3+2	    ^^----------- 00 nachfragen
+;	Bit 3+2	    ^^----------- 01 ueberschreiben
+;	Bit 3+2	    ^^----------- 10 ignorieren
+;	Bit 3+2	    ^^----------- 11 update nach Dateidatum
+;	Bit 4	   ^------------- Textdatei?
+;	Bit 5	  ^-------------- Ausfuehrliche Verzeichnisanzeige
+;	Bit 6	 ^--------------- noch frei (evtl. Druckprotokoll?)
+;	Bit 7	^---------------- Fortschrittsanzeige (0=% 1=#)
+TAKT:	DB	FREQ		; CPU-Taktfrequenz in MHz (4 MHz bei D004)
+
+excl:	db	'!!!TIME&DAT'	; 10 auszuschliessende Dateien
+	db	'????????TMP'	; temporaere Dateien
+	db	'$$$     SUB'	; System-Submit
+	db	'????????$?$'	; temporaere Dateien
+	db	'????????BAK'	; Backup-Dateien
+	db	'[??????]???'	; Dateien mit def. Sektoren
+	db	'BACKUP  LOG'	; Backup.Log nicht automatisch sichern!
+	db	'           '	;
+	db	'           '	;
+	db	'           '	;
+
+KC85:	DB	0FFH		; 00H = D004				4 MHz
+				; 01H = D008 V1.0			4-8 MHz
+				; 02H = D008 V2.0			4-16 MHz
+				; 03H = KC85/3 CP/M im Grundgeraet	2 MHz
+				; 04H = KC85/4 CP/M im Grundgeraet	2 MHz
+				; FFH = anderes CP/M-System
+BS:	DB	80		; Bildschirmbreite fuer DIR-Anzeige
+PORT:	DB	PIO		; Portadresse USB-PIO bei Nicht KC85-Systemen
+BREAK:	DB	BRKT		; Break-Taste abfragen?
+
+;-----------------------------------------------------
+
+	include	USBINC.Z80	; allgemeine Unterprogramme
+
+;-----------------------------------------------------
+
+HELP:	call	version		; Programmversion
+	call	eprint
+	db	cr,lf
+	db	' URUN.COM startet eine COM-Datei direkt vom USB-Stick.',cr,lf
+	db	cr,lf
+	db	' Kommandoformen:',cr,lf
+	db	'   URUN <name.com> <parameter> - COM-Datei starten',cr,lf
+	db	'   URUN <name> <parameter>     - COM-Datei starten',cr,lf
+	db	'   URUN //                     - Anzeige der Hilfeseite'cr,lf,0
+	rst	0		; Abbruch
+
+; Programmstart:
+
+START:	LD	HL,(BDOS+1)
+	LD	L,0
+	LD	SP,HL		; Stack unterhalb BDOS legen
+	dec	h
+	ld	(tpaend),hl	; Obergzenze fuer Ladebereich
+
+	CALL	GETTAKT		; Taktfrequenz beim KC85 ermitteln
+
+	ld	a,(FCB1+1)	; 1. Parameter testen
+	cp	'/'
+	jp	z,help		; // ist Hilfe
+	cp	' '
+	jp	z,help		; kein Parameter -> Hilfe
+;	setopt			; Optionen setzen (bei URUN nicht benoetigt)
+;	call	putud		; DU: merken (DU wird nicht veraendert bei URUN)
+	call	synchr		; Synchronisation
+	jp	c,exit0		; TimeOut oder Error
+
+; Test, ob USB-Stick angeschlossen ist:
+
+	LD	A,SCS		; Short CMD-Modus
+	CALL	put
+	CALL	EXEC
+	jp	c,exit		; Error
+
+	LD	A,IPH		; HEX- bzw. BIN-Modus
+	CALL	put
+	CALL	EXEC
+	jp	c,exit		; Error
+
+	call	exec		; Flash-Disk vorhanden?
+	jp	c,exit
+
+; Test Dateiname auf Wildcards, Dateityp .com ergaenzen:
+
+	ld	hl,fcb1+1	; Dateiname
+	ld	b,8
+sw:	ld	a,(hl)
+	inc	hl
+	cp	'?'		; Wildcard?
+	jp	z,err1		; nicht zulaessig
+	djnz	sw
+	ld	(hl),'C'
+	inc	hl
+	ld	(hl),'O'
+	inc	hl
+	ld	(hl),'M'
+
+; Dateigroesse abfragen:
+
+	ld	a,dir		; DIR <dateiname>
+	call	outnam		; um Dateigroesse zu ermitteln
+	ld	a,cr
+	call	put		; Kommando ausfuehren
+
+	call	get		; 1. Zeichen abholen
+	jp	c,exit		; TimeOut
+	cp	cr
+	jp	nz,err5		; nicht CR
+test1:	call	get		; naechste Zeichen (Dateiname) abholen
+	jp	c,exit		; TimeOut
+	cp	cr		; CR vor Leerzeichen?
+	jp	z,err4		; dann Datei nicht vorhanden (CF-Error)
+	cp	' '		; Trennzeichen?
+	jr	nz,test1
+	ld	hl,filesize0	; Dateigroesse abholen
+	ld	b,4		; 4 Byte
+test2:	call	get
+	jp	c,exit		; TimeOut
+	ld	(hl),a
+	inc	hl
+	djnz	test2
+test3:	call	get
+	jp	c,exit
+	cp	cr		; Zeilenende erkannt?
+	jr	nz,test3
+	call	get
+	jp	c,exit
+	cp	'>'		; Prompt?
+	jp	nz,err5
+	call	get
+	jp	c,exit
+	cp	cr
+	jp	nz,err5
+
+; Dateigroesse in KByte umrechnen (fuer Anzeige):
+
+	ld	de,(filesize0+2); High-Teil
+	ld	a,d
+	or	e
+	jp	nz,err3		; Datei ist groesser als 64KByte
+	ld	hl,(filesize0)	; Low-Teil
+	ld	a,h
+	or	l
+	jp	z,err2		; 0-Byte-Datei
+	ld	bc,1023		; aufrunden auf volle KByte
+	add	hl,bc
+	ex	de,hl
+	ld	bc,0
+	adc	hl,bc		; 32 Bit jetzt in HLDE
+	ld	b,10
+calc1:	srl	h
+	rr	l
+	rr	d
+	rr	e
+	djnz	calc1		; /1024
+	ld	(kbyte),de
+
+; Kontrolle, ob Datei in verbleibenden TPA passt:
+
+	ld	hl,(tpaend)	; Ermitteltes TPA-Ende
+	dec	h		; minus 100h (Ladeadresse CP/M)
+	ld	de,$memry	; Ladebereich direkt nach Programmcode URUN
+	sbc	hl,de		; max. moegliche Dateigroesse
+	ld	bc,(filesize0)	; Groesse der zu lesenden Datei
+	sbc	hl,bc
+	jp	c,err3		; Datei zu gross
+
+; Empfang der Datei einleiten:
+
+	call	eprint
+	db	'Starte Datei ',0
+	ld	de,fcb1+1
+	call	pfn2		; Dateiname anzeigen
+	call	eprint
+	db	' (',0
+	ld	hl,(kbyte)
+	call	phlfdc		; Anzeige Dateigroesse
+	call	eprint
+	db	' KByte)',cr,lf,0
+
+	LD	A,OPR		; Open/read
+	call	outnam		; Datei zum lesen oeffnen
+	call	exec
+	jp	c,exit		; Fehler
+ 
+; Daten einlesen:
+
+	ld	de,filesize
+	ld	hl,filesize0
+	ld	bc,4
+	ldir			; Dateigroesse in Laufvariable kopieren
+	ld	a,(option)
+	rlca
+	call	nc,PROZ		; Anfangsanzeige in Prozent
+
+	ld	bc,(filesize0)	; Dateigroesse
+	LD	A,RDF		; Read from File
+	CALL	put
+	LD	A,' '
+	CALL	put
+	XOR	A
+	CALL	put
+	XOR	A
+	CALL	put
+	ld	a,b		; Dateigroesse
+	CALL	put
+	ld	a,c		; Dateigroesse
+	CALL	put
+	LD	A,CR
+	CALL	put
+	ld	hl,$memry	; Ladeadresse
+READ:	call	brkkey		; BRK-Taste gedrueckt?
+	jp	c,exclos	; ja, Abbruch der laufenden Operation
+	CALL	GET		; Daten lesen
+	jp	c,exclos	; Fehler
+	LD	(HL),A
+	INC	HL
+	DEC	BC
+	push	hl
+	push	bc
+	ld	(filesize),bc	; Laufvariable fuer %-Anzeige eintragen
+	LD	A,C
+	AND	7FH		; alle 128 Byte
+	CALL	Z,PROZ		; die %-Anzeige aktualisieren	
+	pop	bc
+	pop	hl
+	ld	a,b
+	or	c
+	jr	nz,read
+	call	ex1		; Prompt, cr testen
+	jp	c,exclos	; TimeOut
+
+	LD	A,CLF		; Close File (USB)
+	CALL	outnam		; Datei schliessen
+	call	exec
+	jp	c,exit
+	call	eprint
+	db	cr,lf,0
+
+	call	parser		; FCB1 und FCB2 neu erstellen aus restl. Kommandozeile
+
+; Datei umkopieren und starten:
+
+	LD	DE,(tpaend)	; Umlader an TPA-Ende kopieren
+	PUSH	DE
+	LD	HL,UML		; Umlader
+	LD	BC,UML1-UML
+	LDIR			; kopieren
+	LD	HL,$memry	; Ladeadresse
+	LD	DE,100H		; Ziel
+	ld	bc,(filesize0)
+	RET			; und starten
+
+UML:	LDIR
+	LD	HL,0		; Return zu Warmstartadresse 0
+	PUSH	HL		; auf Stack ablegen
+	JP	100h		; geladenes Programm starten
+UML1:
+;=============================================================================
+;  Z C P R  3 . 4     C O M M A N D    L I N E     P A R S I N G    C O D E
+;=============================================================================
+
+; Dieser Programmteil enthaelt einen Auszug aus dem Code von ZCPR 3.4, welcher
+; die Kommandozeile untersucht und daraus zwei FCB's (FCB1, FCB2) erzeugt.
+; Erlaubt sind Angaben der Form DU:NAME.TYP fuer jeden der beiden Parameter.
+; Das Laufwerk wird dabei im Byte 0, der USER-Bereich im s1-Feld des FCB
+; eingetragen. (Der gleiche Parser ist auch im CCP von MLDOS enthalten)
+;
+; Kommandozeile analysieren
+; PE:	HL	Zeiger auf Kommandozeile
+; PA:	FCB1	FCB fuer zweiten Parameter
+;	FCB2	FCB fuer dritten Parameter
+;
+PARSER:	LD	C,_GETDRV	; aktuelles BDOS-Laufwerk holen
+	CALL	BDOS
+	LD	(CURDSK),A	; und merken
+	LD	E,0FFH
+	LD	C,_SETUSR	; aktuelle USER-Nummer abfragen
+	CALL	BDOS
+	LD	(CURUSR),A	; und ebenfalls merken
+
+; zunaechst muss die Kommandozeile um den ersten Parameter gekuerzt werden,
+; denn der erste Parameter ist ja die COM-Datei, welche geladen wird.
+
+	ld	hl,defdma	; DMA-Puffer mit Kommandozeile
+	ld	a,(hl)		; Anzahl Zeichen im DMA-Puffer
+	or	a
+	jr	z,PARS4		; kein weiterer Parameter angegeben
+	ld	c,a		; Anzahl in C mitzaehlen
+	inc	hl
+	ld	a,(hl)		; erstes Zeichen
+	cp	' '		; ist eigentlich immer ein Leerzeichen
+	jr	nz,PARS2
+PARS1:	inc	hl		; Zeichen uebergehen
+	dec	c		; Anzahl-1
+	jr	z,PARS3		; Anzahl=0
+PARS2:	ld	a,(hl)
+	cp	' '		; naechster Parameter?
+	jr	nz,PARS1	; nein, weiter suchen
+	ld	de,defdma+1	; neuen Parameter
+	ld	b,0		; mit Rest-Laenge BC
+	push	bc
+	ldir			; kopieren
+	xor	a
+	ld	(de),a		; Ende-0 anhaengen
+	pop	bc
+PARS3:	ld	a,c		; neue Anzahl
+	ld	(defdma),a	; eintragen
+PARS4:	ld	hl,defdma+1
+
+; CP/M hat in FCB1 den Namen der COM-Datei und in FCB2 den zweiten Parameter
+; eingetragen. Um der COM-Datei auch zwei Parameter (Dateinamen) uebergeben zu
+; koennen, muss jetzt der zweite und dritte Parameter der Kommandozeile neu
+; analysiert werden.
+
+	LD	DE,FCB1
+	PUSH	DE
+	CALL	INIFCB		; FCB1 und FCB2 initialisieren
+	POP	DE		; Zeiger auf 1. FCB
+	CALL	SKSP		; Leerzeichen uebergehen
+	CALL	NZ,SCANNER	; wenn nicht Zeilenende, dann FCB1 erzeugen
+
+	CALL	SKSP		; Leerzeichen uebergehen
+	RET	Z		; Zeilenende
+	LD	DE,FCB2		; Zeiger auf 2. FCB
+				; ..und reinlaufen in SCANNER
+;-------------------------------
+; einen Token der Kommandozeile analysieren und FCB erzeugen
+; (Angaben der Form DU:NAME.TYP werden akzeptiert)
+; PE:	HL	Zeiger in Kommandozeile
+;	DE	FCB-Adresse
+; PA:	HL	zeigt auf Begrenzungszeichen am Ende des Tokens
+;	Z=0	Jokerzeichen enthalten
+;
+SCANNER:LD	BC,(CURUSR)	; aktuelles Laufwerk/USER holen
+	INC	B		; Laufwerk 0..15 -> 1..16
+	LD	(TMPUSR),BC	; DU merken
+	CALL	SCANF8		; moeglichen Dateiname holen
+	CP	':'		; mit Doppelpunkt beendet?
+	JR	NZ,SCAN1	; nein, weiter mit Dateityp
+	INC	HL		; Zeiger nach Doppelpunkt
+	PUSH	DE		; FCB retten
+	INC	DE		; Beginn Name
+	PUSH	HL		; Zeiger auf Kommandozeile retten
+	PUSH	DE		; Zeiger auf FCB+1 retten
+	EX	DE,HL		; HL=FCB+1
+	CALL	DUSCAN		; DU-Angabe behandeln
+	POP	DE		; FCB+1
+	POP	HL		; Kommandozeile
+	LD	C,A		; DU-Errorcode in C merken
+	CALL	IFCB		; Dateiname in FCB loeschen
+	LD	A,C		; DU-Errorcode zurueckholen
+	DEC	DE		; d0-Feld
+	DEC	DE		; rc-Feld (FCB+15)
+	LD	(DE),A		; DU-Error dort ablegen
+	POP	DE		; FCB-Adresse
+ 	LD	A,(TMPDRV)	; gewaehltes Laufwerk
+	LD	(DE),A		; im FCB eintragen
+	CALL	SCANF8		; jetzt nach eigentlichem Dateinamen suchen
+SCAN1:	EX	DE,HL		; FCB-Adresse nach HL
+	LD	BC,8		; weiter bis zum Dateityp
+	ADD	HL,BC
+	CP	'.'		; Dateityp angegeben?
+	JR	NZ,SCAN2	; nein
+	EX	DE,HL		; FCB wieder nach DE
+	INC	HL		; '.' uebergehen
+	LD	B,3		; maximal 3 Zeichen fuer Dateityp
+	CALL	SCANFB		; Dateityp in FCB eintragen
+	EX	DE,HL		; FCB-Adresse wieder nach HL
+SCAN2:	LD	BC,5		; Offset von Dateityp bis s1 im FCB
+	ADD	HL,BC
+	LD	A,(TMPUSR)	; gewaehlter USER-Bereich
+	OR	80H		; USER anwaehlen
+	LD	(HL),A		; im FCB eintragen (Feld s1)
+	EX	DE,HL		; FCB wieder nach DE
+SCAN3:	LD	A,(HL)		; naechstes Zeichen von Kommandozeile holen
+	CP	' '+1
+	JR	C,SCAN4		; fertig wenn Space, Steuerzeichen oder Null
+	CP	';'
+	JR	Z,SCAN4		; fertig, weil Kommandoende
+	INC	HL		; naechstes Zeichen
+	CP	'='
+	JR	NZ,SCAN3	; wenn kein '=' weitersuchen
+QMCNT	EQU	$+1
+SCAN4:	LD	A,0		; Anzahl Fragezeichen im Dateinamen
+	OR	A		; Joker erkannt?
+	RET
+
+;-------------------------------
+; SCANFIELD fuer Dateiname aufrufen und Fragezeichenzaehler ruecksetzen
+; PE:	HL	Kommandozeile
+;	DE	FCB-Adresse
+;
+SCANF8:	XOR	A		; Fragezeichenzaehler ruecksetzen
+	LD	(QMCNT),A
+	LD	B,8		; bis zu 8 Zeichen (Dateiname) testen
+SCANFB:	PUSH	DE		; FCB retten
+	CALL	SCANF		; Parse field of (B) characters into FCB
+	POP	DE		; FCB regenerieren
+	RET
+
+;-------------------------------
+; Feld von Zeichen testen, Jokerzeichen aufbereiten, FCB eintragen
+; PE:	HL	Kommandozeile
+;	DE	FCB-Adresse
+;	B	max. Zeichenzahl
+; PA:	HL	zeigt auf Begrenzerzeichen
+;
+SCANF:	CALL	SDELM		; Begrenzer?
+	RET	Z
+	CP	'*'		; Jokerzeichen expandieren?
+	JR	Z,SCANF1
+	INC	HL		; zum naechsten Zeichen
+	CP	'?'		; Single-Joker?
+	JR	NZ,SCANF2
+SCANF1:	PUSH	HL
+	LD	HL,QMCNT
+	INC	(HL)		; Fragezeichen zaehlen
+	POP	HL
+	LD	A,'?'		; '?' anstatt '*' eintragen
+SCANF2:	INC	DE
+	LD	(DE),A		; in FCB eintragen
+	DJNZ	SCANF		; bis alle Zeichen bearbeitet wurden
+SCANF3:	CALL	SDELM
+	RET	Z		; Begrenzerzeichen gefunden
+	INC	HL
+	JR	SCANF3		; weitersuchen
+
+;-------------------------------
+; Versuch, den Teil vor dem Doppelpunkt als DU zu interpretieren
+; PE:	HL	Kommandozeile
+; PA:	TMPDRV	erkanntes Laufwerk
+;	TMPUSR	erkannter USER-Bereich
+;	A=0,Z=1	DU erkannt
+;
+DUSCAN:	LD	BC,(CURUSR)	; C = aktueller USER, B = aktuelles Laufwerk
+	LD	A,(HL)		; moegliche Laufwerksbezeichnung holen
+	SUB	'A'		; konvertieren nach 0..15
+	JR	C,DUSC1		; < 0, Register B behaelt seinen Wert
+	CP	16
+	JR	NC,DUSC1	; > 15, Register B behaelt seinen Wert
+	LD	B,A		; B mit gewaehltem Laufwerk laden
+	INC	HL		; und Zeiger auf naechstes Zeichen
+DUSC1:	INC	B		; Laufwerk 1..16
+	LD	A,(HL)		; moegliche Userbezeichnung holen
+	CP	' '		; leer?
+	JR	Z,DUSC2		; wenn leer, Register C behaelt seinen Wert
+	PUSH	BC
+	CALL	GETDEZ		; moegliche USER-Nummer nach DE holen
+	POP	BC
+	JR	C,DUERR		; Formatfehler in Dezimalzahl
+	LD	A,D
+	OR	A
+	RET	NZ		; High-Byte nicht Null
+	LD	C,E		; C mit gewaehlter USER-Nummer laden
+DUSC2:	LD	HL,(CURUSR)	; aktuelle Werte nach HL
+	INC	H		; Laufwerk 1..16
+	SBC	HL,BC
+	JR	Z,SETDU		; OK, entspricht den aktuellen Werten
+	LD	A,15
+	CP	C
+	JR	C,DUERR		; USER-Nummer > 15
+SETDU:	LD	(TMPUSR),BC
+	XOR	A		; A=0 und Z=1
+	RET
+	;
+DUERR:	OR	255		; Return NZ to show failure
+	RET
+
+;-------------------------------
+; Leerzeichen und TAB vor Token uebergehen
+; PE:	HL	Kommandozeile
+; PA:	HL	zeigt auf erstes Zeichen, das nicht leer ist
+;	Z=1	Zeile oder Kommando zu Ende
+;
+SKSP1:	INC	HL		; n{chstes Zeichen
+SKSP:	LD	A,(HL)
+	CP	' '		; Space?
+	JR	Z,SKSP1		; ja, uebergehen
+	CP	TAB		; Tabulator?
+	JR	Z,SKSP1		; ja, uebergehen
+	OR	A		; Zeilenende?
+	RET	Z		; ja
+	CP	';'		; Kommandoende?
+	RET
+
+;-------------------------------
+; zwei FCBs initialisieren (loeschen)
+; PE:	DE	FCB-Adresse
+;
+INIFCB:	XOR	A
+	LD	(DE),A		; aktuelles Laufwerk
+	INC	DE		; Dateiname
+	CALL	IFCB		; 1. FCB vorbereiten
+				; ..und reinlaufen fuer 2. FCB
+IFCB:	LD	B,11
+	LD	A,' '
+	CALL	FILL		; 11 Leerzeichen fuer Name und Typ
+	XOR	A
+	LD	(DE),A		; ex=0
+	INC	DE
+	LD	A,(CURUSR)
+	OR	80H
+	LD	(DE),A		; s1=USER
+	INC	DE
+	LD	B,3		; 3mal 0 eintragen fuer
+	XOR	A		; s2, rc und d0 (bzw. aktuelles LW in FCB2)
+FILL:	LD	(DE),A		; Wert eintragen
+	INC	DE		; naechstes Byte
+	DJNZ	FILL
+	RET
+
+;-------------------------------
+; eingegebene Dezimalzahl aufbereiten
+; PE:	HL	Zeichenkette
+; PA:	HL	zeigt auf Begrenzungszeichen nach Zahl
+;	A	Begrenzungszeichen
+;	DE	Wert der Zahl
+;	CY=1	Formatfehler
+;
+GETDEZ:	LD	DE,0		; Startwert
+	OR	A		; CY=0
+DEZN:	CALL	SDELM		; Begrenzer?
+	RET	Z		; ja
+	SUB	'0'
+	RET	C		; Fehler: < '0'
+	CP	10
+	CCF
+	RET	C		; Fehler: > '9'
+	INC	HL		; Zeiger auf n{chstes Zeichen
+	EX	DE,HL
+	ADD	HL,HL		; *2
+	LD	B,H
+	LD	C,L
+	ADD	HL,HL		; *4
+	ADD	HL,HL		; *8
+	ADD	HL,BC		; *10
+	LD	B,0
+	LD	C,A
+	ADD	HL,BC		; neuen Wert addieren
+	EX	DE,HL
+	JR	DEZN
+
+;-------------------------------
+; Test auf Begrenzungszeichen
+; PE:	HL	Kommandozeile
+; PA:	A	Zeichen von (HL)
+;	Z=1	A ist Begrenzer
+;
+SDELM:	LD	A,(HL)		; Zeichen holen
+	EXX			; Zweitregistersatz
+	LD	HL,DELDAT	; Begrenzerliste
+	LD	BC,DELEND-DELDAT; L{nge
+	CPIR			; Zeichen enthalten?
+	EXX			; Register wiederherstellen
+	RET
+
+DELDAT:	DEFB	' =.:;,^<>',0	; Liste Begrenzerzeichen
+DELEND:
+
+;-------------------------------------------------------------------------------
+;
+; Fehlerbehandlung:
+;
+err1:	call	eprint
+	db	'Wildcards nicht zulaessig',cr,lf,0
+	jp	exit
+;
+err2:	call	eprint
+	db	'0-Byte-Datei',cr,lf,0
+	jp	exit
+;
+err3:	call	eprint
+	db	'Datei zu gross',cr,lf,0
+	jp	exit
+;
+err4:	call	eprint
+	db	'Datei ',0
+	ld	de,fcb1+1
+	call	pfn2		; Dateiname anzeigen
+	call	eprint
+	db	' auf USB-Stick nicht vorhanden',cr,lf,0
+	jr	exit
+;
+err5:	call	eprint
+	db	'Unerwartete Vinculum-Antwort',cr,lf,0
+	jr	exit
+;
+exclos:	LD	A,CLF		; Close File (USB)
+	CALL	outnam		; Datei schliessen
+	call	exec
+exit:	LD	A,ECS		; Extend. CMD-Modus
+	CALL	put
+	LD	A,CR
+	CALL	put
+exit0:	call	condin		; evtl. anstehendes BRK abfangen
+;	call	getud		; DU: regenerieren
+	call	deinit		; Treiber deaktivieren
+	rst	0
+
+	prozent			; Fortschrittsanzeige aus USBINC einbinden
+
+; Datenbereich:
+
+	DSEG
+filesize0:	dw	0,0	; Dateigroesse in Byte
+filesize:	dw	0,0	; Dateigroesse in Byte - Laufvariable
+kbyte:		dw	0	; Dateigroesse in KByte
+tpaend:		dw	0	; nutzbare TPA-Endadresse
+
+CURUSR:	DB	0		; aktueller USER-Bereich
+CURDSK:	DB	0		; aktuelles Laufwerk
+TMPUSR:	DB	0		; von Scannerroutine erkannter USER-Bereich
+TMPDRV:	DB	0		; von Scannerroutine erkanntes Laufwerk
+
+	END

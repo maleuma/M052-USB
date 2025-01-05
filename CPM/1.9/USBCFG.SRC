@@ -1,0 +1,329 @@
+;---------------------------------------------------------
+;
+;	UTools Version 1.9 (von M. Leubner)
+;
+; Hilfsprogramme zur Arbeit mit USB-Sticks unter CP/M
+;
+;	USB-Tools konfigurieren mit ZCNFG.COM
+;
+; USBCFG.SRC -> USB19.CFG	21.01.2009 - 16.04.2024
+;---------------------------------------------------------
+; Uebersetzung:		MCFG USBCFG USB19
+;---------------------------------------------------------
+
+; USB  Patch offsets
+
+IDSTR	EQU	0DH		; CFG Filename
+OPTION	EQU	IDSTR+9		; Optionen
+TAKT	EQU	OPTION+1	; CPU-Taktfrequenz (fuer Nicht-KC-Systeme)
+excl1	EQU	TAKT+1		; auszuschliessende Datei 1
+excl2	EQU	excl1+11	; auszuschliessende Datei 2
+excl3	EQU	excl2+11	; auszuschliessende Datei 3
+excl4	EQU	excl3+11	; auszuschliessende Datei 4
+excl5	EQU	excl4+11	; auszuschliessende Datei 5
+excl6	EQU	excl5+11	; auszuschliessende Datei 6
+excl7	EQU	excl6+11	; auszuschliessende Datei 7
+excl8	EQU	excl7+11	; auszuschliessende Datei 8
+excl9	EQU	excl8+11	; auszuschliessende Datei 9
+excl10	EQU	excl9+11	; auszuschliessende Datei 10
+BILD	EQU	excl10+12	; Bildschirmbreite (fuer Nicht KC-Systeme)
+PORT	EQU	BILD+1		; Portadresse USB-PIO (Nicht KC-Systeme)
+BREAK	EQU	PORT+1		; Break-Taste abfragen (Nicht KC-Systeme)
+
+;---------------------------------------------------------
+
+	INCLUDE CNFGDEF.LIB	; allgemeine Definitionen
+
+;---------------------------------------------------------
+
+;
+; Header:
+;
+	RST	0		; Code nicht ausfuehrbar
+	DW	MENU1		; Zeiger zur naechsten Adresse
+
+;---------------------------------------------------------
+
+;
+; Menue 1:
+;
+MENU1:	DW	MENU2,MENU2,SCRN1,CASE1,HELP1	; allgemeine Einstellungen
+MENU2:	DW	MENU1,MENU1,SCRN2,CASE2,HELP2	; Fuer Nicht-KC85-Systeme
+
+;---------------------------------------------------------
+
+;
+; Funktionstabelle 1 (allgemeine Einstellungen)
+;
+CASE1:	DB	(CASE1X-CASE11)/10	; Anzahl Menuepunkte
+	DB	10			; Laenge jedes Records
+
+;	CFG-Dateiname:
+CASE11:	VECTOR	C,	TEXT,	IDSTR,	8,	SCR_C,	0
+;	Anzeige noch vorhandener Daten:
+CASE13:	VECTOR	D,	SWITCH,	OPTION,	1,	SCR_D,	EINAUS
+;	Verzeichnis sortieren:
+CASE14:	VECTOR	S,	SWITCH,	OPTION,	2,	SCR_S,	EINAUS
+;	Fortschrittsanzeige:
+CASE15:	VECTOR	F,	SWITCH,	OPTION,	8,	SCR_F,	BALKEN
+;	auszuschliessende Dateien:
+CASE16:	VECTOR	0,	FILESP,	excl1,	0,	SCR_0,	NULL
+CASE17:	VECTOR	1,	FILESP,	excl2,	0,	SCR_1,	NULL
+CASE18:	VECTOR	2,	FILESP,	excl3,	0,	SCR_2,	NULL
+CASE19:	VECTOR	3,	FILESP,	excl4,	0,	SCR_3,	NULL
+CASE20:	VECTOR	4,	FILESP,	excl5,	0,	SCR_4,	NULL
+CASE21:	VECTOR	5,	FILESP,	excl6,	0,	SCR_5,	NULL
+CASE22:	VECTOR	6,	FILESP,	excl7,	0,	SCR_6,	NULL
+CASE23:	VECTOR	7,	FILESP,	excl8,	0,	SCR_7,	NULL
+CASE24:	VECTOR	8,	FILESP,	excl9,	0,	SCR_8,	NULL
+CASE25:	VECTOR	9,	FILESP,	excl10,	0,	SCR_9,	NULL
+CASE1X:
+;
+; Funktionstabelle 2 (Vorgaben fuer Nicht-KC85-Systeme)
+;
+CASE2:	DB	(CASE3X-CASE31)/10	; Anzahl Menuepunkte
+	DB	10			; Laenge jedes Records
+
+;	CPU-Taktfrequenz:
+CASE31:	VECTOR	T	DECRAD,	TAKT,	1,	SCR_T,	MINMAX
+;	Portadresse UCB-PIO:
+CASE32:	VECTOR	P,	HEXRAD,	PORT,	1,	SCR_P,	0
+;	Bildschirmbreite:
+CASE33:	VECTOR	B,	DECRAD,	BILD,	1,	SCR_B,	BSX
+;	Break-Taste abfragen:
+CASE34:	VECTOR	K,	SWITCH,	BREAK,	1,	SCR_K,	EINAUS
+CASE3X:
+
+EINAUS:	DB	'ja  ',0
+	DB	'nein'
+NULL:	0
+BALKEN:	DB	'Balken ',0
+	DB	'Prozent',0
+MINMAX:	DW	1,32		; CPU-Taktfrequenz min / max
+BSX:	DW	40,80		; Bildschirmbreite
+
+;---------------------------------------------------------
+
+;
+; Text 1: (allgemeines)
+;
+SCRN1:	DB	CR,LF
+	DB	'              USB Tools v1.9 Konfiguration   (16.04.2024)',CR,LF
+	DB	'                allgeneine Einstellungen',CR,LF
+	DB	'              ----------------------------',CR,LF
+	DB	CR,LF
+	DB	'    ',DIM,' Standard CFG-Dateiname                 ',BRIGHT,' (C) '
+SCR_C:	DB	'        ',CR,LF
+
+	DB	CR,LF
+	DB	'    ',DIM,' Anzeige vorhandener Vinculum-Daten?    ',BRIGHT,' (D) '
+SCR_D:	DB	'    ',CR,LF
+
+	DB	CR,LF
+	DB	'    ',DIM,' Verzeichnis sortieren (UDIR/UGET/UPUT) ',BRIGHT,' (S) '
+SCR_S:	DB	'    ',CR,LF
+
+	DB	CR,LF
+	DB	'    ',DIM,' Fortschrittsanzeige (ausser UDIR/USB)  ',BRIGHT,' (F) '
+SCR_F:	DB	'       ',CR,LF
+
+	DB	CR,LF
+	DB	'    ',DIM,' 10 auszuschliessende Dateien: ',BRIGHT
+	DB	CR,LF
+	DB	'                      (0) '
+SCR_0:	DB	'12345678.abc'
+	DB	'       (5) '
+SCR_5:	DB	'12345678.abc',CR,LF
+	DB	'                      (1) '
+SCR_1:	DB	'12345678.abc'
+	DB	'       (6) '
+SCR_6:	DB	'12345678.abc',CR,LF
+	DB	'                      (2) '
+SCR_2:	DB	'12345678.abc'
+	DB	'       (7) '
+SCR_7:	DB	'12345678.abc',CR,LF
+	DB	'                      (3) '
+SCR_3:	DB	'12345678.abc'
+	DB	'       (8) '
+SCR_8:	DB	'12345678.abc',CR,LF
+	DB	'                      (4) '
+SCR_4:	DB	'12345678.abc'
+	DB	'       (9) '
+SCR_9:	DB	'12345678.abc',CR,LF
+	DB	0
+
+;
+; Text 2: (allgemeines)
+;
+SCRN2:	DB	CR,LF
+	DB	'              USB Tools v1.9 Konfiguration   (16.04.2024)',CR,LF
+	DB	'              Fuer Nicht-KC85 CP/M-Systeme',CR,LF
+	DB	'              ----------------------------',CR,LF
+	DB	CR,LF
+	DB	'   ',DIM,' CPU-Taktfrequenz in MHz (1-32)            ',BRIGHT,' (T) '
+SCR_T:	DB	'        ',CR,LF
+
+	DB	CR,LF
+	DB	'   ',DIM,' Basis-Portadresse USB-PIO                 ',BRIGHT,' (P) '
+SCR_P:	DB	'  H ',CR,LF
+
+	DB	CR,LF
+	DB	'   ',DIM,' Bildschirmbreite (40, 64 oder 80 Zeichen) ',BRIGHT,' (B) '
+SCR_B:	DB	'    ',CR,LF
+
+	DB	CR,LF
+	DB	'   ',DIM,' Break-Taste abfragen                      ',BRIGHT,' (K) '
+SCR_K:	DB	'       ',CR,LF,lf
+	DB	0
+
+;---------------------------------------------------------
+
+HELP1:	DB	CR,LF,DIM,' >>>  Konfiguration USB-Tools v1.9  <<< ',BRIGHT,CR,LF
+	;	'------------------------ 40 Zeichen ----'
+	;	'------------------------ 64 Zeichen ----------------------------'
+	;	'------------------------ 80 Zeichen --------------------------------------------'
+
+	DB	CR,LF
+	DB	' Alle 7 zu den UTools gehoerenden Programme USB.COM, UDIR.COM,',cr,lf
+	DB	' UGET.COM, UPUT.COM, UGO.COM, UBACKUP.COM und URESTORE.COM',CR,LF
+	DB	' werden mit der gleichen Konfigurationsdatei USB18.CFG vorein-',cr,lf
+	DB	' gestellt. Dabei haben aber nicht alle Einstellungen eine Aus-',cr,lf
+	DB	' wirkung auf jedes Programm.',CR,LF
+	DB	CR,LF
+
+	DB	CR,LF
+	DB	' (C)  Standard CFG-Dateiname                fuer alle Programme',CR,LF
+	DB	CR,LF
+	DB	' Der Name der fuer alle Programme der UTools zu verwendeten',cr,lf
+	DB	' CFG-Datei stellt den Zugriff auf die richtige CFG-Datei sicher,',cr,lf
+	DB	' auch wenn eine Programmdatei umbenannt wird. Einzugeben ist nur',cr,lf
+	DB	' der Dateiname (8 Zeichen). Der Dateityp ist immer .CFG',CR,LF
+	DB	' Dieser Dateiname sollte nur geaendert werden, wenn die CFG-',cr,lf
+	DB	' Datei umbenannt werden muss.'
+	DB	CR,LF
+
+	DB	':'	; Seitenwechsel
+
+	DB	CR,LF,DIM,' >>>  Konfiguration USB-Tools v1.9  <<< ',BRIGHT,CR,LF
+	;	'------------------------ 64 Zeichen ----------------------------'
+	;	'------------------------ 80 Zeichen --------------------------------------------'
+
+	DB	CR,LF
+	DB	' (D)  Anzeige vorhandener Vinculum-Daten    fuer alle Programme',CR,LF
+	DB	CR,LF
+	DB	' Vor der Ausfuehrung neuer Kommandos wird eine Synchronisation',cr,lf
+	DB	' mit dem Vinculum-Chip durchgefuehrt. Dabei werden alle noch',cr,lf
+	DB	' anliegenden Daten eingelesen, welche z.B. nach einem Abbruch',cr,lf
+	DB	' (BRK) nicht abgeholt wurden. Hier kann eingestellt werden, ob',cr,lf
+	DB	' diese Daten am Bildschirm zu sehen sind.',CR,LF
+	DB	' Standardmaessig ist dies nur bei USB.COM eingeschalten.',CR,LF
+	DB	CR,LF
+
+	DB	CR,LF
+	DB	' (S)  Verzeichnis sortieren                  UDIR / UGET / UPUT',CR,LF
+	DB	CR,LF
+	DB	' Nach Einlesen der Verzeichnisse sowohl vom USB-Stick als auch',cr,lf
+	DB	' vom CP/M-Verzeichnis werden diese alphabetisch sortiert. Diese',cr,lf
+	DB	' Sortierung kann hier bei Bedarf ausgeschalten werden.',CR,LF
+	DB	' Zum Einschalten der Sortierung gibt es den Schalter /S in der',cr,lf
+	DB	' Kommandozeile.',CR,LF
+	DB	CR,LF
+
+	DB	':'	; Seitenwechsel
+
+	DB	CR,LF,DIM,' >>>  Konfiguration USB-Tools v1.9  <<< ',BRIGHT,CR,LF
+	;	'------------------------ 64 Zeichen ----------------------------'
+	;	'------------------------ 80 Zeichen --------------------------------------------'
+
+	DB	CR,LF
+	DB	' (F)  Fortschrittsanzeige        UGET/UPUT/UGO/UBACKUP/URESTORE',CR,LF
+	DB	CR,LF
+	DB	' Die Uebertragung von Dateien erfolgt in Bloecken zu je 128',CR,LF
+	DB	' Byte. Der Fortschritt kann entweder in Prozent der Dateigroesse',cr,lf
+	DB	' oder wie von den MTools bekannt als Balken mit je einem #-',cr,lf
+	DB	' Zeichen pro Datenblock. Fuer die MTools-Anzeige gibt es auch',cr,lf
+	DB	' den Schalter /M in der Kommandozeile (ausse bei UGO.COM).',CR,LF
+	DB	CR,LF
+
+	DB	CR,LF
+	DB	' (0-9)  10 auszuschliessende Dateien                              UGET / UPUT',CR,LF
+	DB	CR,LF
+	DB	' Zur Uebertragung von Dateien mit UGET und UPUT koennen in der',cr,lf
+	DB	' Kommandozeile mit einer Dateimaske die betreffenden Dateien',cr,lf
+	DB	' ausgewaehlt werden, *.* zum Beispiel fuer alle Dateien.',CR,LF
+	DB	' In den Konfigurationen kann eine Liste von bis zu 10 Datei-',cr,lf
+	DB	' masken eingegeben werden, welche aus dieser Liste ausgefiltert',cr,lf
+	DB	' werden. Voreingestellt sind unter anderem !!!TIME&.DAT und',cr,lf
+	DB	' einige temporaere Dateien wie *.TMP oder *.BAK.',CR,LF
+	DB	0
+
+HELP2:	DB	CR,LF,DIM,' >>>  Konfiguration USB-Tools v1.9  <<< ',BRIGHT,CR,LF
+	;	'------------------------ 64 Zeichen ----------------------------'
+	;	'------------------------ 80 Zeichen --------------------------------------------'
+
+	DB	cr,lf
+	DB	' Die USB-Tools sind fuer das KC85-System (MicroDOS oder ML-DOS)',cr,lf
+	DB	' entwickelt worden. Die Programme sind aber auch auf anderen',cr,lf
+	DB	' CP/M-Systeme lauffaehig. Dazu sind weitere Parameter einzu-',cr,lf
+	DB	' stellen. Fuer das KC85-System sind diese Werte nicht relevant.',cr,lf
+	DB	' Die Einstellungen sind fuer jedes Programm separat vorzunehmen!',cr,lf
+	DB	cr,lf
+
+	DB	CR,LF
+	DB	' (T)  CPU-Taktfrequenz                      fuer alle Programme',CR,LF
+	DB	CR,LF
+	DB	' Die Wartezeit fuer das Auslesen der vorhandenen Vinculum-Daten',cr,lf
+	DB	' wird in einer Zeitschleife ueberwacht, dazu muss das Programm',cr,lf
+	DB	' die CPU-Taktfrequenz kennen. Der Eingabebereich ist auf 1-32MHz',cr,lf
+	DB	' eingeschraenkt. Bei nicht ganzzahliger Taktfrequenz bitte auf',cr,lf
+	DB	' volle MHz aufrunden. (voreingestellt sind 4MHz)',CR,LF
+	DB	CR,LF
+
+	DB	':'	; Seitenwechsel
+
+	DB	CR,LF,DIM,' >>>  Konfiguration USB-Tools v1.9  <<< ',BRIGHT,CR,LF
+	;	'------------------------ 64 Zeichen ----------------------------'
+	;	'------------------------ 80 Zeichen --------------------------------------------'
+
+	DB	CR,LF
+	DB	' (P)  Portadresse USB-PIO                   fuer alle Programme',CR,LF
+	DB	CR,LF
+	DB	' Damit der Datenaustausch mit der USB-Schnittstelle gelingt,',cr,lf
+	DB	' muessen die Programme die Adresse des PIO-Bausteins kennen,',cr,lf
+	DB	' welcher die USB-Schnittstelle bedient. Einzugeben ist die',cr,lf
+	DB	' hexadezimale Basisadresse, welche PIO-Datenport A adressiert.',cr,lf
+	DB	CR,LF
+
+	DB	CR,LF
+	DB	' (B)  Bildschirmbreite                            nur fuer UDIR',CR,LF
+	DB	CR,LF
+	DB	' Das Auflisten des Verzeichnisinhaltes erfolgt mit 80 Zeichen',cr,lf
+	DB	' pro Zeile (Voreinstellung). Hierbei werden die Dateinamen in 5',cr,lf
+	DB	' Spalten angezeigt, bei der erweiterten Anzeige mit allen 3',cr,lf
+	DB	' Datumseintraegen. Alternativ kann fuer kleine Bildschirme eine',cr,lf
+	DB	' Breite von 64 oder 40 Zeichen eingestellt werden. Dann erfolgt',cr,lf
+	DB	' die Anzeige in 4 bzw. 2 Spalten, nur mit dem Datum der letzten',cr,lf
+	DB	' Aenderung bzw. ganz ohne Datum.',cr,lf
+	DB	CR,LF
+
+	DB	':'	; Seitenwechsel
+
+	DB	CR,LF,DIM,' >>>  Konfiguration USB-Tools v1.9  <<< ',BRIGHT,CR,LF
+	;	'------------------------ 64 Zeichen ----------------------------'
+	;	'------------------------ 80 Zeichen --------------------------------------------'
+
+	DB	CR,LF
+	DB	' (K)  Break-Taste abfragen                  fuer alle Programme',CR,LF
+	DB	CR,LF
+	DB	' Normalerweise erfolgt bei jeder Dateneingabe von der USB-',cr,lf
+	DB	' Schnittstelle eine Tastaturabfrage mit Test auf ESC- oder BRK-',cr,lf
+	DB	' Taste. Aufwaendige BIOS-Routinen zur Tastaturabfrage (wie beim',cr,lf
+	DB	' Z1013) koennen die Uebertragungsgeschwindigkeit stark bremsen.',cr,lf
+	DB	' Sollte dies der Fall sein, kann diese Abfrage abgeschaltet',cr,lf
+	DB	' werden. Dann entfaellt jedoch die Moeglichkeit, eine laufende',cr,lf
+	DB	' Uebertragung per Tastendruck abzubrechen.',cr,lf
+	DB	CR,LF
+
+	DB	0
+
+	END

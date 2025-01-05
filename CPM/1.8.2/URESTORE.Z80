@@ -1,0 +1,651 @@
+;-----------------------------------------------------
+;
+;	UTools Version 1.8.2 (von M. Leubner)
+;
+; Hilfsprogramme zur Arbeit mit USB-Sticks unter CP/M
+;	(nach einer Idee von Volker Pohlers 07/2016)
+;
+;	Diskettenimage von USB-Stick auf Diskette schreiben
+;
+; URESTORE.Z80 -> URESTORE.COM	10.04.2022 - 03.12.2022
+;-----------------------------------------------------
+; Uebersetzung:		SLRZ80 URESTORE/R
+;			SLRNK URESTORE/N,/V,/A:100,URESTORE,/E
+;			ERA URESTORE.REL
+;-----------------------------------------------------
+
+	.Z80
+	CSEG
+
+	JP	START		; eigentlicher Programstart
+	DB	'Z3ENV'		; ENV von Z-System
+	DB	1		; Typ-1
+ENVPTR:	DW	0		; Zeiger zu ENV-Beschreibung
+	DW	100h		; ORG-Adresse
+
+; Konfigurationsdatenbereich:
+
+	DB	'USB18   '	; Name der CFG-Datei
+VERS:	DB	18H		; Version 1.8
+OPTION:	DB	00000010b	; Optionen:
+;	Bit 0	       ^--------- Anzeige der noch vorhandenen Daten bei Start
+;	Bit 1	      ^---------- Verzeichnis sortieren?
+;	Bit 3+2	    ^^----------- 00 nachfragen
+;	Bit 3+2	    ^^----------- 01 ueberschreiben
+;	Bit 3+2	    ^^----------- 10 ignorieren
+;	Bit 3+2	    ^^----------- 11 update nach Dateidatum
+;	Bit 4	   ^------------- Textdatei?
+;	Bit 5	  ^-------------- Ausfuehrliche Anzeige mit Spur+Sektor
+;	Bit 6	 ^--------------- noch frei (evtl. Druckprotokoll?)
+;	Bit 7	^---------------- Fortschrittsanzeige (0=% 1=#)
+TAKT:	DB	FREQ		; CPU-Taktfrequenz in MHz (4 MHz bei D004)
+
+excl:	DS	10*11,' '	; 10 auszuschliessende Dateien
+
+KC85:	DB	0		; '8' = KC85-System	0 = anderes CP/M-System
+BS:	DB	80		; Bildschirmbreite fuer DIR-Anzeige
+PORT:	DB	PIO		; Portadresse USB-PIO bei Nicht KC85-Systemen
+BREAK:	DB	BRKT		; Break-Taste abfragen?
+
+;-----------------------------------------------------
+
+	include	USBINC.Z80	; allgemeine Unterprogramme
+
+;-----------------------------------------------------
+
+HELP:	call	version		; Programmversion
+	call	eprint
+	db	cr,lf
+	db	' URESTORE.COM erzeugt aus einem Image vom USB-Stick eine Diskette.',cr,lf
+	db	' Es ist eine formatierte Diskette erforderlich, welche komplett',cr,lf
+	db	' ueberschrieben wird!',cr,lf
+	db	cr,lf
+	db	' Kommandoformen:',cr,lf
+	db	'   URESTORE <name.img> /opt     - benutzt das aktuelle Laufwerk',cr,lf
+	db	'   URESTORE Lw: <name.img> /opt - benutzt das angegebene Laufwerk',cr,lf
+	db	' Ohne Angabe wird als Dateityp *.IMG verwendet.',cr,lf
+	db	cr,lf
+	db	' Optionen:',cr,lf
+	db	'   / - Anzeige der Hilfeseite',cr,lf,0
+	ld	hl,option
+	bit	0,(hl)
+	jr	nz,h0
+	call	eprint
+	db	'   V - vorher anliegende Meldungen anzeigen',cr,lf,0
+h0:
+	cp	1
+	jr	z,h3
+	call	eprint
+	db	'   O - Diskette ungefragt mit dem Image ueberschreiben',cr,lf,0
+h3:
+	bit	5,(hl)
+	jr	nz,h5
+	call	eprint
+	db	'   W - ausfuehrliche Information (Spur+Sektor) anzeigen',cr,lf,0
+h5:
+	bit	7,(hl)
+	jr	nz,h7
+	call	eprint
+	db	'   M - Fortschrittsanzeige wie MTOOLs',cr,lf,0
+h7:
+	rst	0		; Abbruch
+
+; Programmstart:
+
+START:	LD	HL,(BDOS+1)
+	LD	L,0
+	LD	SP,HL		; Stack unterhalb BDOS legen
+
+	CALL	GETTAKT		; Taktfrequenz beim KC85 ermitteln
+
+	setopt			; Optionen setzen
+	call	putud		; DU: merken fuer exit
+	call	synchr		; Synchronisation
+	jp	c,exit		; Break, TimeOut oder Error
+
+; Test, ob USB-Stick angeschlossen ist:
+
+	LD	A,SCS		; Short CMD-Modus
+	CALL	put
+	CALL	EXEC
+	jp	c,exit		; Error
+
+	LD	A,IPH		; HEX- bzw. BIN-Modus
+	CALL	put
+	CALL	EXEC
+	jp	c,exit		; Error
+
+	call	exec		; Flash-Disk vorhanden?
+	jp	c,exit
+
+; Laufwerk ermitteln und im BIOS einstellen:
+
+	ld	hl,fcb1		; erster Parameter
+	ld	a,(hl)		; Laufwerk (1-16)
+	or	a		; Laufwerk angegeben?
+	jr	nz,lwok		; ja, dann dieses benutzen
+	LD	C,_GETDRV	; ansonsten aktuelles BDOS-Laufwerk holen
+	CALL	BDOS
+	inc	a		; 1-16
+lwok:	ld	(drive),a
+	dec	a		; 0-15 fuer BIOS-Funktion
+	ld	c,a
+	call	seldsk		; im BIOS anwaehlen
+	ld	a,h
+	or	l		; HL=0 wenn Laufwerk nicht vorhanden ist
+	jp	z,err2		; Fehler: LW nicht vorhanden
+	ld	c,(hl)
+	inc	hl
+	ld	b,(hl)
+	ld	(XLT),bc	; Adresse Sektor-Umrechentabelle (XLT)
+	ld	bc,9
+	add	hl,bc		; DPH+10 = DPB-Adresse
+	ld	e,(hl)
+	inc	hl
+	ld	d,(hl)
+	push	de
+	pop	ix		; DPB-Adresse in IX bereitstellen
+
+	ld	hl,fcb1+1	; Dateiname im FCB1
+	ld	a,(hl)		; erstes Zeichen
+	cp	' '		; Dateiname im ersten Parameter?
+	jr	nz,wild		; ja, diesen benutzen
+	ld	hl,fcb2+1	; Dateiname im FCB2
+	ld	a,(hl)		; erstes Zeichen
+	cp	' '		; Dateiname angegeben?
+	jp	z,help		; nein, Hilfe anzeigen
+	ld	de,fcb1+1
+	ld	bc,11
+	ldir			; Dateiname in FCB1 kopieren
+
+; Test Dateiname auf Wildcards, bei leerem Dateityp .img ergaenzen:
+
+wild:	ld	hl,fcb1+1	; Dateiname
+	ld	b,8		; 8 Zeichen Dateityp
+sw:	ld	a,(hl)
+	inc	hl
+	cp	'?'		; Wildcard?
+	jp	z,err1		; nicht zulaessig
+	djnz	sw
+	ld	a,(hl)		; erstes Zeichen vom Dateityp
+	cp	' '		; Dateityp angegeben?
+	jr	nz,ber		; ja, weiter mit Berechnung
+	ld	(hl),'I'
+	inc	hl
+	ld	(hl),'M'
+	inc	hl
+	ld	(hl),'G'
+
+; Laufwerksparameter berechnen (Anzahl Spuren und Sektoren):
+
+BER:	LD	L,(IX+0)
+	LD	H,(IX+1)	; HL = Anzahl Sektoren pro Spur
+	LD	(SPT),HL	;	80 = 50H bei 780K-Diskette
+	EX	DE,HL
+
+	LD	B,(IX+2)	; BSH	4 bei 780K-Diskette
+	LD	L,(IX+5)	; HL = Anzahl Bloecke -1 einschl. Verzeichnis
+	LD	H,(IX+6)	; DSM
+	INC	HL		;	390 = 186H bei 780K-Diskette
+
+	XOR	A
+MULS:	ADD	HL,HL		; Berechnung der Sektoren pro Diskette
+	ADC	A,0		; Ergebnis 24 Bit in AHL
+	DJNZ	MULS		; AHL = 6240
+
+	LD	B,H		; Berechnung der Spuren fuer die Datenbloecke
+	LD	C,L
+	LD	L,A
+	LD	H,0		; HLBC = Divident
+	CALL	DIV32		; HLBC / DE = BC	6240/80=78
+	LD	A,H
+	OR	L		; HL = Rest der Division
+	JR	Z,DIVS		; kein Rest vorhanden
+	INC	BC		; noch eine Spur fuer den Rest dazu zaehlen
+
+DIVS:	LD	L,(IX+13)
+	LD	H,(IX+14)	; OFFS	Anzahl Systemspuren
+	ADD	HL,BC		; mit den Datenspuren zusammenzaehlen
+	LD	(TPD),HL	; Spuren pro Diskette
+
+; Hier die ermittelte Diskettenparameter anzeigen
+
+	call	eprint
+	db	'Laufwerk ',0
+	ld	a,(drive)	; 1-16
+	add	a,40H
+	call	COUT		; Laufwerksbuchstabe anzeigen
+	call	eprint
+	db	': mit ',0
+	ld	hl,(TPD)
+	call	phlfdc		; Anzahl der Spuren
+	call	eprint
+	db	' Spuren und ',0
+	ld	hl,(spt)
+	call	phlfdc		; Anzahl der Sektoren
+	call	eprint
+	db	' Sektoren = ',0
+
+	ld	de,(TPD)
+	ld	bc,(SPT)
+	call	mul32		; Sektoren * Spuren = Sektoren pro Diskette
+	ld	(filesize0),bc
+	ld	(filesize0+2),hl
+	ld	de,8		; 8 Sektoren sind 1 Kilobyte
+	call	div32		; umrechnen in in Kilobyte
+	ld	h,b
+	ld	l,c
+	call	phlfdc
+	call	eprint
+	db	' KByte',cr,lf,0
+
+; Dateigroesse der Image-Datei abfragen:
+
+	ld	a,dir		; DIR <dateiname>
+	call	outnam		; um Dateigroesse zu ermitteln
+	ld	a,cr
+	call	put		; Kommando ausfuehren
+
+	call	get		; 1. Zeichen abholen
+	jp	c,exit		; Break oder TimeOut
+	cp	cr
+	jp	c,err7		; nicht CR
+test1:	call	get		; naechste Zeichen (Dateiname) abholen
+	jp	c,exit		; Break oder TimeOut
+	cp	cr		; CR vor Leerzeichen?
+	jp	z,err6		; dann Datei nicht vorhanden (CF-Error)
+	cp	' '		; Trennzeichen?
+	jr	nz,test1
+	ld	hl,filesize	; Dateigroesse abholen
+	ld	b,4		; 4 Byte
+test2:	call	get
+	jp	c,exit		; Break oder TimeOut
+	ld	(hl),a
+	inc	hl
+	djnz	test2
+test3:	call	get
+	jp	c,exit
+	cp	cr		; Zeilenende erkannt?
+	jr	nz,test3
+	call	get
+	jp	c,exit
+	cp	'>'		; Prompt?
+	jp	nz,err7
+	call	get
+	jp	c,exit
+	cp	cr
+	jp	nz,err7
+
+; Dateidatum der vorhandenen Datei ermitteln:
+
+	ld	a,dirt		; DIRT <dateiname>
+	call	outnam		; um Dateidatum zu ermitteln
+	ld	a,cr
+	call	put		; Kommando ausfuehren
+	call	get		; 1. Zeichen abholen
+	jp	c,exit		; Break oder TimeOut
+	cp	cr
+	jp	c,err7		; nicht CR
+OPU1:	call	get		; naechste Zeichen (Dateiname) abholen
+	jp	c,exit		; Break oder TimeOut
+	cp	cr		; CR vor Leerzeichen?
+	jp	z,err6		; dann Datei nicht vorhanden (CF-Error)
+	cp	' '		; Trennzeichen?
+	jr	nz,OPU1
+	ld	hl,data		; Dateidatum abholen
+	ld	b,10		; 10 Byte
+OPU2:	call	get
+	jp	c,exit		; Break oder TimeOut
+	ld	(hl),a
+	inc	hl
+	djnz	OPU2
+OPU3:	call	get
+	jp	c,exit
+	cp	cr		; Zeilenende erkannt?
+	jr	nz,OPU3
+	call	get
+	jp	c,exit
+	cp	'>'		; Prompt?
+	jp	nz,err7
+	call	get
+	jp	c,exit
+	cp	cr
+	jp	nz,err7
+	ld	hl,data+6	; dritter Wert
+	ld	de,Datum
+	call	m2utim		; Aenderungs-Datum konvertieren
+
+	call	eprint
+	db	'Image-Datei ',0
+	ld	de,fcb1+1
+	call	pfn2		; Dateiname anzeigen
+	ld	hl,Datum
+	call	danz		; Datum anzeigen
+	call	eprint
+	db	' (',0
+
+; Dateigroesse in KByte umrechnen und anzeigen:
+
+	ld	de,(filesize+2)	; High-Teil
+	ld	hl,(filesize)	; Low-Teil
+	ld	bc,1023		; aufrunden auf volle KByte
+	add	hl,bc
+	ex	de,hl
+	ld	bc,0
+	adc	hl,bc		; 32 Bit jetzt in HLDE
+	ld	b,10
+calc1:	srl	h
+	rr	l
+	rr	d
+	rr	e
+	djnz	calc1		; /1024
+	ld	a,h
+	or	l
+	jr	z,calc2
+	call	eprint
+	db	'> 64 MByte)',0	; Datei ist 64MByte oder groesser!
+	jr	calc3
+	;
+calc2:	ex	de,hl
+	call	phlfdc		; Anzeige Dateigroesse
+	call	eprint
+	db	' KByte)',cr,lf,0
+calc3:
+
+; Dateigroesse kontrollieren:
+; Filesize = Groesse der Datei auf dem Stick in Byte
+; filesize0 = Groesse der Diskette in Sektoren
+
+	ld	b,7		; 2^7 = 128
+rot7:	ld	hl,filesize+3	; Groesse der Datei umrechnen in Bloecke
+	srl	(hl)
+	dec	hl
+	rr	(hl)
+	dec	hl
+	rr	(hl)
+	dec	hl
+	rr	(hl)
+	jp	c,err3		; Dateigroesse nicht passend
+	djnz	rot7
+	ld	b,4		; hl=filesize (Anzahl Bloecke Image-Datei)
+	ld	de,filesize0	; de=filesize0 (Anzahl Bloecke Diskette)
+cmp4:	ld	a,(de)
+	cp	(hl)
+	jp	nz,err3		; Dateigroesse nicht passend
+	inc	de
+	inc	hl
+	djnz	cmp4
+
+; Sicherheitsabfrage:
+
+	db	'Image-Datei ',0
+	ld	de,fcb1+1
+	call	pfn2		; Dateiname anzeigen
+	call	eprint
+	db	' vom USB-Stick auf Diskette schreiben',0
+
+	ld	hl,option
+	ld	a,(hl)
+	and	0ch		; Option bei vorhandener Datei
+	cp	4		; Option O, ueberschreiben?
+	jr	z,over		; nein
+noo:	call	eprint
+	db	' (j/n)? ',0
+ask:	call	capin
+	cp	3		; Break?
+	jp	z,exit		; -> Abbruch
+	cp	'N'
+	jr	z,TOK		; nein
+	cp	'J'
+	jr	nz,ask
+tok:	push	af
+	call	cout		; Zeichen anzeigen
+	pop	af
+	cp	'J'
+	jp	nz,exit		; nicht mit "Ja" geantwortet, Abbruch
+over:	call	eprint
+	db	cr,lf,0		; neue Zeile
+
+; Empfangen der Image-Datei einleiten:
+
+	ld	bc,defdma	; Standardpuffer einstellen
+	call	DMASET		; im BIOS
+
+	ld	hl,0
+	ld	(Spur),hl	; mit Spur 0 beginnen
+	ld	(Sektor),hl	; und Sektor 0 beginnen
+
+	LD	A,OPR		; Open/read
+	call	outnam		; Datei zum Lesen oeffnen
+	call	exec
+	jp	c,err4		; Fehler
+
+; Sektor fuer Sektor von USB lesen und per BIOS-Funktion auf Diskette schreiben:
+
+RD3:	LD	BC,(SPUR)
+	CALL	SETTRK		; Spur einstellen
+;
+; 29.11.2022: Umrechnung der Sektornummer hinzugefuegt.
+; Erforderlich zum Beispiel fuer CP/A am KC87 oder PC1715. Dort wird die
+; Sektornummer um 1 erhoeht, auch wenn keine Umrechentabelle vorgegeben wird.
+;
+RD2:	LD	BC,(SEKTOR)	; Sektornummer
+	LD	DE,(XLT)	; Sektor-Umrechentabelle
+	CALL	SECTRAN		; Sektornummer umrechnen (wegen CP/A)
+	LD	B,H		; umgerechnete Sektornummer in HL
+	LD	C,L		; nach BC kopieren fuer SETSEC
+	CALL	SETSEC		; Sektornummer einstellen
+
+; Anzeigen, was gerade bearbeitet wird
+
+	ld	a,(option)	; Option /W?
+	bit	5,a		; Spur+Sektor anzeigen?
+	jr	z,disp0		; nein
+	call	disp		; Spur+Sektor anzeigen
+	jr	disp1
+	;
+disp0:	call	proz		; Fortschrittsanzeige in Prozent oder als #
+disp1:	call	brkkey		; BRK-Taste gedrueckt?
+	jp	c,exclos	; ja, Abbruch der laufenden Operation
+
+; Sektor von USB-Stick lesen
+
+	LD	A,RDF		; Read from File
+	CALL	put
+	LD	A,' '
+	CALL	put
+	XOR	A
+	CALL	put
+	XOR	A
+	CALL	put
+	XOR	A
+	CALL	put
+	LD	A,128		; Sektorgroesse
+	CALL	put
+	LD	A,CR
+	CALL	put
+	ld	hl,defdma	; Datenpuffer
+	ld	b,128
+READ2:	CALL	GET		; Daten lesen
+	jp	c,err4		; USB-Lesefehler oder TimeOut
+	LD	(HL),A
+	INC	HL
+	DJNZ	READ2
+	call	ex1		; Prompt, cr testen
+	jp	c,exclos	; BRK/TimeOut
+
+; Sektor auf Diskette schreiben
+
+	CALL	WRBIOS		; Sektor schreiben
+	or	a		; fehlerfrei geschrieben?
+	jp	nz,err9		; Schreibfehler Diskette
+
+; Sektorzaehler verringern, Spur- und Sektornummer erhoehen
+
+	ld	hl,filesize	; (restliche) Dateigroesse
+	ld	a,(hl)
+	sub	1		; -1 Sektor
+	ld	(hl),a
+	inc	hl
+	ld	a,(hl)
+	sbc	a,0
+	ld	(hl),a
+	inc	hl
+	ld	a,(hl)
+	sbc	a,0
+	ld	(hl),a
+
+	ld	hl,(Sektor)
+	inc	hl		; naechster Sektor
+	ld	(Sektor),hl
+	ld	de,(spt)
+	sbc	hl,de		; letzter Sektor der Spur bearbeitet?
+	jp	nz,RD2		; nein
+	ld	(Sektor),hl	; wieder mit Sektor 0 beginnen
+
+	ld	hl,(Spur)
+	inc	hl		; naechste Spur
+	ld	(Spur),hl
+	ld	de,(tpd)
+	sbc	hl,de		; letzte Spur der Diskette bearbeitet?
+	jp	nz,RD3		; nein
+
+; Datei schliessen:
+
+close:	LD	A,CLF		; Close File (USB)
+	CALL	outnam		; Datei schliessen
+	call	exec
+	jp	c,exit		; Fehler
+	call	eprint
+	db	cr,'Diskette erfolgreich wiederhergestellt.',cr,lf,0
+	jp	exit
+
+; aktuelle Spur und Sektor anzeigen
+
+disp:	call	eprint
+	db	cr,'Spur ',0	; dahinter noch Spur
+	ld	hl,(spur)
+	call	phlfdc
+	call	eprint
+	db	', Sektor ',0	; und Sektor anzeigen
+	ld	hl,(Sektor)
+	call	phlfdc
+	call	eprint
+	db	'  ',0
+	ret
+
+;-------------------------------------------------------------------------------
+;
+; Fehlerbehandlung:
+;
+err1:	call	eprint
+	db	'Wildcards im Dateiname unzulaessig',cr,lf,0
+	jp	exit
+;
+err2:	call	eprint
+	db	'Laufwerk nicht vorhanden',cr,lf,0
+	jp	exit
+;
+err3:	call	eprint
+	db	'Dateigroesse stimmt nicht ueberein',cr,lf,0
+	jp	exit
+;
+err4:	call	eprint
+	db	'Lesefehler USB',cr,lf,0
+	jr	exclos
+;
+err6:	call	eprint
+	db	'Datei ',0
+	ld	de,fcb1+1
+	call	pfn2		; Dateiname anzeigen
+	call	eprint
+	db	' auf USB-Stick nicht vorhanden',cr,lf,0
+	jr	exit
+;
+err7:	call	eprint
+	db	'Unerwartete Vinculum-Antwort',cr,lf,0
+	jr	exit
+;
+err9:	call	eprint
+	db	cr,lf,'Diskette Schreibfehler',0
+	call	disp		; Spur und Sektor anzeigen
+	call	eprint
+	db	cr,lf,0
+exclos:	LD	A,CLF		; Close File (USB)
+	CALL	outnam		; Datei schliessen
+	call	exec
+exit:	LD	A,ECS		; Extend. CMD-Modus
+	CALL	put
+	LD	A,CR
+	CALL	put
+	call	condin		; evtl. anstehendes BRK abfangen
+	call	getud		; DU: regenerieren
+	call	deinit		; Treiber deaktivieren
+	rst	0
+
+; Dateidatum anzeigen:
+; PE:	HL	Zeiger auf Datumsfeld im CP/M-Format
+
+danz:	call	eprint
+	db	', ',0
+	inc	hl
+	inc	hl
+	ld	a,(hl)		; Tag
+	call	pa2hc
+	ld	a,'.'
+	call	cout
+	dec	hl
+	ld	a,(hl)		; Monat
+	call	pa2hc
+	ld	a,'.'
+	call	cout
+	dec	hl
+	ld	a,(hl)		; Jahr
+	cp	78h
+	ld	a,19h		; Jahrhundert 1978-1999
+	adc	a,0
+	daa			; oder 2000-2077
+	call	pa2hc
+	ld	a,(hl)		; Jahr
+	call	pa2hc
+	ld	a,' '
+	call	cout
+	inc	hl
+	inc	hl
+	inc	hl
+	ld	a,(hl)		; Stunde
+	call	pa2hc
+	ld	a,':'
+	call	cout
+	inc	hl
+	ld	a,(hl)		; Minute
+	call	pa2hc
+	ret
+
+	prozent			; Fortschrittsanzeige aus USBINC einbinden
+
+; Datenbereich:
+
+	DSEG
+filesize0:	dw	0,0	; Diskettengroesse in Sektoren
+filesize:	dw	0,0	; Diskettengroesse in Sektoren - Laufvariable
+kbyte:		dw	0	; Dateigroesse in KByte
+data:		ds	10,0	; 10 Byte Datenpuffer fuer DIRT
+
+DOSDAT:		DW	0,0	; MS-DOS Datum
+JAHR:		DB	22H	; Jahr	Systemzeit von CP/M-Format (BCD)
+MONAT:		DB	04H	; Monat
+TAG:		DB	08H	; Tag
+STUNDE:		DB	18H	; Stunde
+MINUTE:		DB	00H	; Minute
+		DB	00H	; Sekunde
+Datum:		DS	5,0	; Datum der vorhandenen Datei
+
+; ermittelte Laufwerksparameter:
+DRIVE:	DB	0		; Laufwerk (A:=1 bis P:=16)
+SPT:	DW	80		; Anzahl Sektoren pro Spur
+TPD:	DW	80		; Anzahl Spuren pro Diskette
+Spur:	DW	0		; Spurzaehler
+Sektor:	DW	0		; Sektorzaehler
+XLT:	DW	0		; Adresse der Sektorumrechentabelle
+	END

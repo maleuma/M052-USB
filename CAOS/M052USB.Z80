@@ -1,0 +1,5038 @@
+;------------------------------------------------------------------------------
+;
+; USB-Software fuer VDIP1/VDIP2 des Moduls M052 mit Treiber fuer CAOS 4.6+
+;	Version 3.3	fuer KC85/3/4/5
+;
+; CAOS 2.2 funktioniert nicht wegen festem Prologbyte und fehlender
+;	Unterprogramme 3Ch=WININ, 43h=INIEA, 45h=ZKOUT, 46h=MENU)
+;
+; HC901-CAOS funktioniert nicht wegen festem Prologbyte und fehlender
+;	Unterprogramme 43h=INIEA, 45h=ZKOUT, 46h=MENU)
+;
+; getestet unter CAOS 3.1, CAOS 3.3, CAOS 3.4, CAOS 4.1 bis 4.9
+;
+;	+-----------------------------------+
+;	:	Schaltplan Version 1.3      :
+;	+-----------------------------------+
+;	: PIO-A bidirektional		    :
+;	: PIO-B Bitberieb / Statusabfrage   :
+;	: Terminal-Interrupt von BSTB !     :
+;	+-----------------------------------+
+;
+; Includes:	CAOS48.INC	CAOS-Vereinbarungen
+;		UBASEX.INC	BASIC-Erweiterung (bis CAOS 4.5)
+;		UDEVEX.INC	EDAS-Erweiterung (bis CAOS 4.5)
+;
+; Uebersetzen:
+;	SLRZ80 M052USB/A
+;	REN M052USB.COM M052USB.KCC
+;
+;------------------------------------------------------------------------------
+;
+;	Menueworte:
+;
+; %VINCULUM	Terminalprogramm
+; %MENU		Menue auflisten			*
+; %uload	Datei laden			*
+; %usave	Datei speichern			*
+; %udir		Verzeichnis anzeigen		*
+;
+; %basic	UBASEX+BASIC starten		**
+; %rebasic	UBASEX+REBASIC			**
+; %bsave	KCB-Datei auf USB abspeichern	**
+;
+; %edas		EDAS mit UDEVEX starten		***
+; %reedas	REEDAS mit UDEVEX starten	***
+;
+; *	fuer CAOS 3.1 bis CAOS 4.5 ohne DEVICE-Funktion
+; **	BASIC-Erweiterungen fuer CAOS 3.1 bis CAOS 4.5
+; ***	EDAS-Erweiterung fuer CAOS 3.1 bis CAOS 4.5
+;
+; M052USB.Z80	(c) Mario Leubner, 20.12.2007 bis 28.11.2023
+;------------------------------------------------------------------------------
+
+;TAST	EQU	0	; serielle Tastatur? wird extern vorgegeben
+ISRIX	EQU	1	; 1 = ISR-Tabelle nach IX-auslesen
+			; 0 = ISR-Tabelle direkt auslesen
+
+; Versionsdatum nur hier aendern:
+TAG	EQU	18
+MONAT	EQU	02
+JAHR	EQU	2024
+
+; MACRO zum Erzeugen des Datums-Strings
+DATSTRING	MACRO
+	DB	TAG/10		+ '0'	; Tag Zehner
+	DB	TAG	 MOD 10 + '0'	; Tag Einer
+	DB	'.'
+	DB	MONAT/10	+ '0'	; Monat Zehner
+	DB	MONAT	 MOD 10 + '0'	; Monat Einer
+	DB	'.'
+	DB	JAHR/1000       + '0'	; Jahr Tausender
+	DB	JAHR/100 MOD 10 + '0'	; Jahr Hunderter
+	DB	JAHR/10  MOD 10 + '0'	; Jahr Zehner
+	DB	JAHR     MOD 10 + '0'	; Jahr Einer
+	ENDM
+
+	include	CAOS48.INC	; CAOS-Vereinbarungen
+
+; M052-Vereinbarungen:
+
+MKENN	EQU	0FDH	; Kennung M052
+
+IVEK	EQU	0D0H	; Interrupt-Vektor USB-PIO
+	;	01D0H = (IX-32)
+	;	01D1H = (IX-31)
+
+; Arbeitszellen im RAM-0:
+
+NAME	EQU	0	; Dateiname 8 Zeichen, Typ 3 Zeichen
+
+MODE	EQU	NAME+11	; Bit 1,0: Terminal-Betriebsart
+			;	0 = normal
+			;	1 = Steuerzeichen darstellen
+			;	2 = alle Zeichen hexadezimal anzeigen
+			; Bit 3,2: Interruptmode
+			;	0 = CAOS (FIFO-Daten loeschen)
+			;	4 = Filemode (FIFO-Daten behalten)
+			;	8 = Terminal (FIFO-Daten anzeigen)
+			; Bit 4-6: unbenutzt = 0
+			; Bit 7 = 1 wenn VNC2 (Tastatur) erkannt wurde
+DATUM	EQU	NAME+12	; Datum im DOS-Format
+DTIME	EQU	NAME+14	; Uhrzeit im DOS-Format
+
+; ab hier Arbeitszellen fuer Terminal-Mode:
+
+SLOT	EQU	0010h	; Steckplatz Modul M052
+MSTW	EQU	SLOT+1	; urspruenglicher Schaltzustand
+VERSION	EQU	SLOT+2	; ermittelte CAOS-Version
+OLDPR	EQU	SLOT+3	; Systemprompt merken fuer EXIT
+ZHEX	EQU	SLOT+4	; hier wird der HEX-Code als Zeichen erzeugt
+OLDISR	EQU	ZHEX+8	; Original-ISR von CTC2 hier merken
+ISR2	EQU	ZHEX+10	; CTC-ISR zur Zeitanzeige (direkt nach Arbeitszellen)
+
+if tast
+
+ISR47	EQU	00AEh	; bis 00E0H	ISR im RAM0 ab CAOS 4.7
+	; bis max. 00FFh
+ISR42	EQU	0108h	; bis 013AH	ISR im RAM0 bei anderen CAOS-Versionen
+else
+
+ISR0	EQU	ISR2+ENDISC-ISRC3	; Terminal-ISR im RAM0 (nach CTC-ISR)
+
+endif
+
+; M052 Portadressen:
+
+PIO52A	EQU	2Ch	; Daten A (FIFO-Datenbyte)
+PIO52B	EQU	2Dh	; Daten B (Steuersignale)
+PIO52AS	EQU	2Eh	; Steuer A
+PIO52BS	EQU	2Fh	; Steuer B
+
+; Steuerbyte-Kombinationen:
+
+if tast				; Grundstellung
+ST0	EQU	11110100b	; F4H: PROG#=1, RESET#=1, DATAREQ#=1, RD&WR inaktiv
+ST_RES	EQU	10110100b	; B4H:          RESET#=0
+ST_RD	EQU	11110000b	; F0H:		RD#=0
+ST_WR	EQU	11111100b	; FCH:		WR=1
+
+INTON	MACRO
+	LD	A,(MODE)
+	AND	11110011b	; Bit 2+3 ruecksetzen
+	OR	8		; Terminal-Mode fuer Interrupt setzen
+	LD	(MODE),A
+	ENDM
+INTOF	MACRO
+	LD	A,(MODE)
+	AND	11110011b	; Bit 2+3 ruecksetzen
+	OR	4		; File-Mode fuer Interrupt setzen
+	LD	(MODE),A
+	ENDM
+INTX	MACRO			; Wechsel vom Terminal zu CAOS
+_1:	CALL	GET		; noch Daten vorhanden?
+	JR	NC,_1		; ja, alles abholen
+	LD	A,(MODE)	; erst danach:
+	AND	11110000b	; Bit 0-3 ruecksetzen	
+	LD	(MODE),A	; CAOS-Mode fuer Interrupt
+	ENDM
+else
+ST0	EQU	11010100b	; D4h: PROG#=1, RESET#=1, DATAREQ#=1, RD&WR inaktiv
+ST_RES	EQU	10010100b	; 94H:          RESET#=0
+ST_RD	EQU	11010000b	; D0H:		RD#=0
+ST_WR	EQU	11011100b	; DCH:		WR=1
+
+INTON	MACRO
+	LD	A,83H		; Terminal-Interrupt EIN
+	OUT	(PIO52BS),A
+	ENDM
+INTOF	MACRO
+	LD	A,3		; Terminal-Interrupt AUS
+	OUT	(PIO52BS),A
+	ENDM
+INTX	MACRO
+	LD	A,3		; Terminal-Interrupt AUS
+	OUT	(PIO52BS),A	; bei Wechsel zu CAOS
+	ENDM
+endif
+FMODE	MACRO
+	PUSH	HL		; HL sichern
+	LD	HL,CMODE	; Nach Rueckkehr Fehleranzeige, CAOS-Mode
+	EX	(SP),HL		; als RET-Adresse ablegen auf Stack
+	ENDM
+
+; Vinculum-Kommandos:
+
+DIR	EQU	01H	; List file(s)
+CD	EQU	02H	; Change current directory
+DLF	EQU	07H	; Delete File
+WRF	EQU	08H	; Write to File
+OPW	EQU	09H	; Open/write
+CLF	EQU	0AH	; Close
+RDF	EQU	0BH	; Read from File
+REN	EQU	0CH	; Rename File (or Directory)
+OPR	EQU	0EH	; Open/read
+SCS	EQU	10H	; Short CMD
+ECS	EQU	11H	; Extend. CMD
+SEK	EQU	28H	; Seek
+QP1	EQU	2BH	; Query port 1
+QP2	EQU	2CH	; Query port 2
+DIRT	EQU	2FH	; List File Date&Time
+QD	EQU	85H	; Query device
+SC	EQU	86H	; Set device
+IPH	EQU	91H	; Binaer-Modus einstellen
+SSU	EQU	9AH	; Send setup data to device control endpoint
+
+; CAOS-Vorblock:
+	DB	'USBM052.KCC'	; 11 Byte Dateiname
+	DS	5,0
+	DB	2		; 2 Argumente
+	DW	ROMBEG		; Anfangsadresse
+	DW	ROMEND		; Endadresse
+	DW	0		; keine Startadresse
+	DS	95,0		; Rest von Vorblock
+	DATSTRING		; Versions-Datum
+
+	.PHASE	0C000H		; Basisadresse im (E)EPROM
+ROMBEG:
+;------------------------------------------------------------------------------
+;
+; Treiber fuer CAOS 4.6+ ab Adresse 0C000h, Konzept zu Funktion:
+;	Alle Programme nutzen die Schnittstellen der SUTAB, auch die
+;	CAOS-internen Routinen SAVE, LOAD, MBIN und MBOUT...
+;
+; Aufbau Geraete-Treiber-Tabelle, 32 Byte pro Eintrag:
+;
+; Kennbyte	0-7 entsprechend Treiber	1 Byte		 1
+; Modulsteckplatz				1 Byte		 2
+; Modulsteuerbyte EIN				1 Byte		 3
+; Modulsteuerbyte AUS				1 Byte		 4
+; Bezeichnung:	z.B. 'Tape'			4 Byte		 8
+; Lesen:	ISRI, MBI, CSRI			6 Byte		14
+; Schreiben:	ISRO, MBO, CSRO			6 Byte		20
+; BASIC:	MBIN, MBOUT			4 Byte		24
+; Kommandos:	DIR, CD, ERA, REN		8 Byte		32
+; direkt danach ist ein Einsprung zur Initialisierung
+;
+; 20.08.2017: Vinculum bleibt fuer Treiber im Short-Command-Modus!
+;------------------------------------------------------------------------------
+
+; CAOS 4.7 - Sprungtabelle Treiber Nr. 2 - USB
+;
+	DB	46h		; Kennung 1 (spaeter die Nr. des Treibers)
+	DB	46h		; Kennung 2 (spaeter Modulsteckplatz, wird bei Suche eingetragen)
+SWI:	DB	0,0C5H		; SWITCH-Befehl aus/ein
+	DB	'USB',0		; Name des Treibers
+	DW	UMBO		; 00/01 Ausgabe Datenblock 128 Byte
+	DW	UMBI		; 01/05 Einlesen Datenblock 128 Byte
+	DW	UISRO		; 02/08 Ausgabedatei oeffnen und ersten Block 01h ausgeben
+	DW	UCSRO		; 03/09 Ausgabedatei schliessen und Endeblock FFh ausgeben
+	DW	UISRI		; 04/0A Eingabedatei oeffnen und Block 01 einlesen
+	DW	UCSRI		; 05/0B Eingabedatei schliessen
+;	DW	UMBIN		; 06/37 Einlesen 1 Byte (BASIC-Schnittstelle) *
+	DW	M052SW		; 06: Treiber-Version abfragen
+	DW	USR		; 07: Treibespezifisches ab USB-Version 3.0
+;	DW	UMBOUT		; 07/38 Ausgabe 1 Byte (BASIC-Schnittstelle) *
+	DW	UDIR		; 08: DIR = Verzeichnisanzeige mit Maske
+	DW	UCD		; 09: CD  = Laufwerkwechsel
+	DW	UERA		; 10: ERA = Datei loeschen
+	DW	UREN		; 11: REN = Datei umbenennen
+;
+;	* UMBIN und UMBOUT waren fuer CAOS 4.6 geplant, jedoch nicht genutzt
+;	  weil CAOS 4.6 noch keine Treiber aus Modulen einbinden konnte.
+
+; Erweiterung der Sprungtabelle fuer direkte Nutzung (bei USB-Tastatur)
+
+	JP	INITDRV		; C020h Treiberinitialisierung (B=Steckplatz!)
+	JR	M052SW		; C023h Version der USB-Software abfragen
+VERS:	DB	33H		; C025h Version 3.3 der USB-Software in BCD
+	JP	MODE4		; C026h File-Mode einstellen
+	;			; C029h CAOS-Mode einstellen
+MODE3:	LD	A,(MODE)
+	AND	11110011b	; Bit 2+3 ruecksetzen (CAOS-Mode)
+	JR	MODE0
+	;
+MODE4:	LD	A,(MODE)
+	AND	11110011b	; Bit 2+3 ruecksetzen
+	OR	4		; File-Mode fuer Interrupt
+MODE0:	LD	(MODE),A
+	RET
+;							===============
+; File-Mode und PIO an					USER-Funktion 0
+;							===============
+USR0:	CALL	DEV		; Adresse in DEVTAB ermitteln
+	SET	2,(HL)		; PIO ein
+	JR	MODE4
+;							===============
+; CAOS-Mode und PIO aus					USER-Funktion 1
+;							===============
+USR1:	CALL	DEV		; Adresse in DEVTAB ermitteln
+	RES	2,(HL)		; PIO aus
+	JR	MODE3
+
+DEV:	; Steuerbyte in Device-Tabelle ermitteln
+	LD	A,(IX+8)	; Device-Nr. in Bit 2-4
+	AND	00011100b	; Device-Nr. ausfiltern
+	RLCA
+	RLCA			; Nr. *8
+	RLCA
+	OR	2		; Position fuer Modul aus
+	LD	L,A
+	LD	H,High(DEVTAB)	; (HL)=Steuerbyte fuer Modul aus
+	RET
+;
+; Treiber-Version abfragen					** 06 **
+;
+; PA:	A	Versionsnummer BCD
+;	HL	Versions-String (uninteressant wenn EEPROM aus ist)
+; VR:	HL,AF
+;
+
+M052SW:	LD	HL,VERTXT	; Textstring der Software
+	LD	A,(VERS)	; Versionsnummer BCD
+	AND	A		; CY=0
+	RET
+;
+; USB fuer Treiber initialisieren:
+; (hier Einsprung von CAOS direkt nach Modulsuche und Auffinden des Treibers)
+; (Modul ist bereits eingeschaltet, Treibertabelle kopiert von CAOS)
+; PE:	B	Steckplatz
+; PA:	CY=1	Fehler
+;
+INITDRV:
+if tast	; PIO auf Tastatur-Interrupt einstellen
+
+; ***************** Test1 *****************
+	push	bc		; Steckplatz retten
+	call	USBVER		; USB-Version anzeigen
+	CALL	PV1
+	DB	CRLF
+
+; PIO initialisieren ohne Interrupt
+	LD	HL,INIT1	; Grundinitialisierung zunaechst ohne Interrupt
+				; RESET-Impuls nur bei Soft-RESET
+	LD	B,(HL)		; Anzahl Ports = 3
+	INC	HL
+x01:	CALL	PV1		; PIO initialisieren
+	DB	INIEA		; nicht mit INIME wegen EI in INIME
+	DJNZ	x01
+
+; Kontrolle, ob bereits eine Bootmeldung anliegt
+;	CALL	pv1
+;	DB	OSTR
+;	DB	'1:',0
+
+	ld	bc,0		; Zeitschleife fuer Datentest		Takte:
+x02:	IN	A,(PIO52B)	; Steuersignale scannen			11
+	rrca			;					4
+	jr	nc,x05		; es liegen Daten an			7
+	push	bc		; diese beiden Befehle dienen		11
+	pop	bc		; nur als Takte der Zeitschleife	10
+	dec	bc		;					6
+	ld	a,b		;					4
+	or	c		;					4
+	jr	nz,x02		; -> ergibt ca. 2,5 Sekunden		12
+
+; keine Daten bekommen, RESET-Impuls ausloesen
+	CALL	pv1
+	DB	OSTR		; Anzeigen, dass RESET ausgeloest wird
+	DB	'RESET',CR,LF,0
+	LD	A,ST_RES	; RESET#=0
+	OUT	(PIO52B),A
+	LD	A,ST0		; RESET#=1
+	OUT	(PIO52B),A
+
+	ld	bc,0		; Zeitschleife fuer TimeOut		Takte:
+x03:	IN	A,(PIO52B)	; Steuersignale scannen			11
+	rrca			;					4
+	jr	nc,x05		; es liegen Daten an			7
+	push	bc		; diese beiden Befehle dienen		11
+	pop	bc		; nur als Takte der Zeitschleife	10
+	dec	bc		;					6
+	ld	a,b		;					4
+	or	c		;					4
+	jr	nz,x03		; -> ergibt ca. 2,5 Sekunden		12
+	CALL	PV1
+	DB	OSTR
+	DB	'No Data ',0
+
+x04:	pop	bc		; B = Steckplatz vom Stack nehmen
+	call	pv1		; keine Empfangsdaten bekommen
+	db	ostr
+	db	'TimeOut',0
+	xor	a		; ca. 1,5 Sekunden warten zum Lesen der Anzeige
+	call	pv1
+	db	wait
+	scf			; Fehler-Flag
+	ret
+
+x05:	ld	de,2000h	; xmal kontrollieren
+x06:	IN	A,(PIO52B)	; Steuersignale scannen
+	rrca
+	jr	c,x03		; Bit ist wieder nach High gewechselt!
+	dec	de
+	ld	a,d
+	or	e
+	jr	nz,x06		; kontrollieren ob das stabil ist
+	call	get		; erstes Datenbyte abholen
+
+; Bootmeldung anzeigen:
+	;LD	HL,STBT
+	;SET	3,(HL)		; auch Steuerzeichen darstellen
+x07:	ld	bc,4000h	; x-mal kontrollieren
+	cp	cr
+	jr	nz,x08
+	call	pv1		; CR+LF ergaenzen
+	db	crt
+	ld	a,lf
+x08:	CALL	pv1
+	db	crt
+x09:	call	get
+	jr	nc,x07		; weitere Daten gelesen -> anzeigen
+	dec	bc
+	ld	a,b
+	or	c
+	jr	nz,x09		; kontrollieren bis BC=0
+	;RES	3,(HL)
+
+; Schreib-Bereitschaft kontrollieren:
+	ld	b,0
+x10:	in	a,(PIO52B)	; Status abfragen
+	rrca
+	rrca
+	jr	nc,x11		; bereit, Daten zu schreiben
+	djnz	x10
+	CALL	PV1
+	DB	OSTR
+	DB	'Not Ready ',0
+	jr	x04		; TimeOut
+;
+x11:	POP	BC		; B=Steckplatz fuer ISR
+	LD	DE,ISR47	; Ziel der M052-ISR im RAM 0
+
+; Hier Einsprung von Initialisierung Terminal
+;	B = Steckplatz
+;	DE = Adresse der ISR
+INIT:
+if isrix
+	LD	(IX-32),E	; Adresse der ISR
+	LD	(IX-31),D	; in Interrupttabelle eintragen
+else
+	LD	(01D0H),DE	; ISR eintragen in Interrupttabelle
+endif
+	LD	A,B		; Steckplatz
+	LD	HL,ISRX		; Quelle der ISR im ROM
+	LD	BC,STPL1-ISRX
+	LDIR			; Teil 1 der ISR in RAM0 kopieren
+	LD	(DE),A		; Steckplatz in ISR eintragen
+	INC	HL
+	INC	DE
+	LD	BC,STPL2-STPL1-1
+	LDIR			; Teil 2 der ISR in RAM0 kopieren
+	LD	(DE),A		; Steckplatz in ISR eintragen
+	INC	HL
+	INC	DE
+	LD	BC,ENDX-STPL2-1
+	LDIR			; Teil 3 der ISR in RAM0 kopieren
+	XOR	A
+	LD	(MODE),A	; Interrupt-Mode: CAOS
+				; Terminal-Mode: normal
+; PIO initialisieren
+
+	LD	HL,INIT3	; PIO-Initialisierung mit Tastatur-Interrupt
+else
+	LD	HL,INIT1	; PIO-Initialisierung fuer CAOS ohne Interrupt
+
+; Hier Einsprung von Initialisierung Terminal
+INIT:
+endif
+	LD	B,(HL)		; Anzahl Ports = 3
+	INC	HL
+INIX:	CALL	PV1		; PIO initialisieren
+	DB	INIEA		; nicht mit INIME wegen EI in INIME
+	DJNZ	INIX
+	LD	HL,DAT16	; aus EPROM das
+	LD	DE,DATUM	; Standard-Datum
+	LD	BC,4
+	LDIR			; als Vorbelegung kopieren
+
+; 20.04.2021: PIO-Logik fuer Tastatur-Interrupt freigeben
+if tast
+I11:	CALL	GET		; vorhandene Daten abholen
+	JR	NC,I11
+endif
+; ***************** Test2 *****************
+;	ld	a,'<'
+;	call	pv1
+;	db	crt
+;	in	a,(pio52b)	; Steuer-Signale scannen
+;	call	pv1
+;	db	ahex		; und anzeigen
+;	ld	a,'>'
+;	call	pv1
+;	db	crt
+;	ld	a,0
+;	call	pv1		; 256*6ms = 1,5s warten
+;	db	wait
+;	call	pv1
+;	db	crlf
+; ***************** Test2 *****************
+
+; Neu ab USB-Version 2.9 fuer CAOS 4.8:
+; INITIAL.UUU nur abarbeiten wenn Datei auf USB-Stick existiert.
+
+	BIT	6,(IX+8)	; ist bereits ein Kommando aktiviert worden?
+	RET	NZ		; ja, dann hier nichts weiter unternehmen
+
+; 1. Kontrolle, ob F-Tastenkommando INIT vorbereitet ist:
+	LD	HL,(FTAST)	; F-Taste-Speicher
+	LD	DE,INCMD	; INIT-Kommando zum Vergleich
+	LD	B,6		; 6 Zeichen testen
+IN1:	LD	A,(DE)
+	CP	(HL)
+	JR	NZ,ENDOK	; anderes Kommando
+	INC	HL
+	INC	DE
+	DJNZ	IN1
+
+; 2. Test, ob INITIAL.UUU existiert:
+	LD	HL,INUUU	; INITIAL.UUU
+	CALL	TEST		; DIR INITIAL.UUU dazu benutzen
+	JR	C,ENDERR	; Fehler aufgetreten
+
+; INITIAL.UUU vorhanden:
+	SET	6,(IX+8)	; jetzt Kommando aktivieren
+ENDOK:	AND	A		; OK
+	RET
+
+; TimeOut, kein USB-Stick oder INITIAL.UUU nicht vorhanden:
+ENDERR:	LD	B,0
+ENDER1:	CALL	GET		; Daten abholen
+	JR	NC,ENDERR	; bis alles abgeholt ist
+	DJNZ	ENDER1		; 256mal kontrollieren
+	LD	HL,0		; vorbereitetes INIT-Kommando komplett
+	LD	(FTAST),HL	; deaktivieren, damit ein evtl. vorhandenes
+				; weiteres M052 dieses nicht aktivieren kann
+				; (das wird ja nicht das aktive DEVICE)
+NOK:	SCF			; Fehler-Flag
+	RET
+
+INUUU:	DB	'INITIAL.UUU',0	; Dateiname fuer Test
+INCMD:	DB	'INIT',cr,0	; Autostart-Kommando (zum Vergleich)
+
+; Bei Erstinitialisierung des PIO-Port-B muss sichergestellt werden, dass der
+; RESET-Ausgang (Bit 6) High bleibt. Im Einschaltzustand sind die PIO-Ports
+; hochohmig und werden ueber Pull-Up-Widerstaende auf High gezogen, deshalb:
+; 1. PIO-Port A initialisieren, und PIO damit aus dem RESET-Zustand holen
+;    (so wird auch das Ausgaberegister von Port B beschreibbar)
+; 2. Port B Datenwort einschreiben
+; 3. Betriebsart fuer Port B einstellen um das Datenwort zu uebernehmen.
+; Ein RESET-Impuls mus also separat ausgeloest werden, falls erforderlich
+; Der RESET-Impuls wirkt nur, wenn die PIO bereits vorher initialisiert war
+; (also nur bei einem Soft-RESET, Sprung auf Adresse E000H)
+
+; Initialisierungsdaten M052-PIO (USB) - fuer CAOS-Treiber ohne Interrupt:
+
+INIT1:	DB	3		; 3 Ports
+
+	DB	PIO52AS		; Steuerport A
+	 DB	2
+	  DB	8FH		; bidirektional
+	  DB	7		; kein INT
+
+	DB	PIO52B		; Datenport B
+	 DB	2
+	  DB	ST_RES		; RESET         (PROG#=1, RESET#=0, DATAREQ#=1)
+	  DB	ST0		; Grundstellung (PROG#=1, RESET#=1, DATAREQ#=1)
+
+	DB	PIO52BS		; Steuerport B
+	 DB	3		; Anzahl (ohne Interrupt)
+	  DB	0CFH		; Bitbetrieb
+	  DB	00100011b	; I/O-Pins festlegen
+		; Bit 0 = RXF#		Eingang	Low = Empfangsdaten verfuegbar
+		; Bit 1 = TXE#		Eingang	Low = Bereit zum Daten schreiben
+		; Bit 2 = RD#		Ausgang	Lese-Impuls Low-aktiv
+		; Bit 3 = WR		Ausgang	Schreibimpuls High-aktiv
+		; Bit 4 = DATAREQ#	Ausgang bei VNC2: Takt zu USB-Tastatur
+		; Bit 5 = DATAACK#	Eingang bei VNC2: Scan von USB-Tastatur
+		; Bit 6 = RESET#	Ausgang	Low loest Ruecksetzen aus
+		; Bit 7 = PROG#		Ausgang Low schaltet in Programmiermode
+;	  DB	IVEK		; Int.-Vektor
+	  DB	7		; DI, keine Maske folgt
+;	  DB	0FFH		; Maske: kein Bit aktiv
+
+; Versionsdatum 16 Bit: yyyy yyym mmmd dddd
+DAT16:	DB	High((JAHR-1980)*512+MONAT*32+TAG)
+	DB	Low ((JAHR-1980)*512+MONAT*32+TAG)
+	DW	0	; 00:00 Uhr
+;
+; Treiberspezifische Funktionen aufrufen			** 07 **
+;
+; PE:	E	Nr. der Funktion
+; PA:	CY=1	Fehler (z.B. Funktions-Nr. unbekannt)
+; VR:	DE,F
+;
+USR:	LD	D,A		; Parameter A retten
+	LD	A,E		; Nr. der Funktion
+	CP	(UTABEND-USRTAB)/2
+	JR	C,USR2
+	LD	DE,'NF'		; Fehlercode "NoFunction"
+	SCF			; CY=1: Funktion nicht vorhanden!
+	RET
+	;
+USR2:	LD	A,D		; Parameter A wiederherstellen
+	LD	D,0
+	PUSH	HL
+	LD	HL,USRTAB	; Tabelle der USER-Routinen
+	ADD	HL,DE
+	ADD	HL,DE
+	LD	E,(HL)
+	INC	HL
+	LD	D,(HL)		; DE=Adresse der USR-Routine
+	EX	DE,HL		; HL=Adresse
+	EX	(SP),HL		; Sprungadresse auf Stack
+	RET
+;
+; Sprungtabelle der Treiberspezifischen Unter-Funktionen
+;
+USRTAB:	DW	USR0	; 0 = USER-Mode einstellen, PIO an
+	DW	USR1	; 1 = CAOS-Mode einstellen, PIO aus
+	DW	RAWOUT	; 2 = direktes Schreiben eines Bytes in den VNC
+	DW	RAWIN	; 3 = direktes Lesen eines Bytes vom VNC
+	DW	TEST	; 4 = Test, ob Datei vorhanden ist, Groesse ermitteln
+	DW	OPEN	; 5 = Datei zum Lesen oeffnen
+	DW	READ1	; 6 = 1 Datenbyte aus Datei lesen
+	DW	READN	; 7 = n Datenbytes aus Datei lesen
+	DW	CREATE	; 8 = Neue Datei zum Schreiben oeffnen (CREATE)
+	DW	APPEND	; 9 = Datei zum Schreiben oeffnen (APPEND)
+	DW	WRITE1	;10 = 1 Datenbyte in Datei schreiben (WRITE)
+	DW	WRITEN	;11 = n Datenbytes in Datei schreiben (WRITEN)
+	DW	CLOSE	;12 = Datei schliessen (CLOSE)
+	DW	FFIRST	;13 = FindFirst (erster Verzeichniseintrag)
+	DW	FNEXT	;14 = FindNext (naechster Verzeichniseintrag)
+	DW	STICK	;15 = Test, ob Stick vorhanden ist
+UTABEND:
+;							================
+; Test, ob USB-Stick vorhanden ist			USER-Funktion 15
+;							================
+; PA:	CY=0	USB-Stick vorhanden
+;	CY=1	USB-Stick nicht vorhanden, dann
+;	DE	Fehlercode "ND"
+; VR:	AF,BC,DE,HL
+;
+STICK:	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+	CALL	USYNC		; Synchronisieren, File-Mode, SCS, IPH
+	RET	C		; TimeOut oder Error
+	JP	EXEC		; Kommando ausfuehern
+;							===============
+; Test, ob Datei vorhanden ist				USER-Funktion 4
+; dabei keine Fehler anzeigen !!!			===============
+;
+; PE:	HL	Zeiger auf Dateiname (Null-terminierter String)
+; PA:	CY=0	Datei vorhanden, dann
+;	DEBC	Groesse der Datei in Byte (max. 4 GByte)
+;	CY=1	Datei nicht vorhanden, dann
+;	HL	Zeiger auf Dateiname, gekuerzt um evtl. vorangestellten Pfad
+;	DE	Fehlercode
+; VR:	AF,BC,DE,HL
+;
+TEST:	LD	A,(HL)		; erstes Zeichen des Dateinamens
+	AND	A		; leer?
+	JR	NZ,TEST1
+	LD	DE,'MO'		; Missing Operand
+	SCF			; Fehlerflag
+	RET
+	;
+TEST1:	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+TEST2:	CALL	usync		; Synchronisieren, File-Mode, SCS, IPH
+	RET	C		; TimeOut oder Error
+	EX	DE,HL		; Dateiname nach DE
+	CALL	PFAD		; evtl. Pfad einstellen
+	RET	C		; Pfad fehlerhaft
+	EX	DE,HL		; Dateiname nach HL
+	push	hl
+	CALL	UNAME		; Name 8.3 konvertieren und ablegen
+	pop	hl
+;
+; Ermittlung Dateigroesse
+; PE:	(NAME)	Dateiname im Puffer
+; PA:	CY=1	Fehler, dann
+;	DE	Fehlercode
+;	CY=0	OK, dann
+;	DEBC	Dateigroesse
+
+TESTX:	LD	A,DIR		; DIR-Kommando
+	CALL	PUTX
+	LD	A,' '		; Trennzeichen zwischen Kommando und Name
+	CALL	PUTX
+	CALL	OUTNAM		; Dateiname
+	RET	C
+	LD	A,CR		; Kommandoabschluss
+	CALL	PUTX
+	CALL	GETX		; Ergebnis holen
+	CP	CR		; kommt da ein einzelnes CR?
+	JR	NZ,TEST5	; falls nicht, dann gleich der Dateiname
+TEST4:	CALL	GETX		; naechstes Zeichen (Dateiname) abholen
+	CP	CR		; kommt ein CR bevor ein Leerzeichen auftrat?
+	SCF			; Fehler-Kennung
+	RET	Z		; dann war es ein Fehler-Code!
+TEST5:	LD	D,E		; erstes Zeichen vom Fehlercode nach D
+	LD	E,A		; zweites Zeichen vom Fehlercode nach E
+	CP	' '		; Trennzeichen zwischen Name und Groesse?
+	JR	NZ,TEST4	; weiter lesen bis Dateiname fertig ist
+
+; 4 Byte (Dateigroesse) abholen nach DEBC
+	CALL	GETX		; 1. Byte der Dateigroesse LSB
+	LD	C,A
+	CALL	GETX		; 2. Byte der Dateigroesse
+	LD	B,A
+	CALL	GETX		; 3. Byte der Dateigroesse
+	LD	E,A
+	CALL	GETX		; 4. Byte der Dateigroesse MSB
+	LD	D,A
+TEST6:	CALL	GETX
+	CP	CR		; Zeilenende?
+	JR	NZ,TEST6
+	JP	PRMT		; Prompt oder Fehlercode abholen
+	;
+TEST7:	PUSH	AF		; Fehlerflag erhalten
+	CALL	MODE3		; Interrupt: CAOS-Mode
+	POP	AF
+	RET
+;							===============
+; Datei zum Lesen oeffnen				USER-Funktion 5
+;							===============
+;
+; PE:	HL	Zeiger auf Dateiname (Null-terminierter String)
+;
+; PA:	CY=0	OK, dann
+;	DEBC	Dateigroesse
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+;
+; VR:	AF,BC,DE,HL
+;
+OPEN:	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+	CALL	usync		; Synchronisieren, File-Mode, SCS, IPH
+	RET	C		; TimeOut oder Error
+	EX	DE,HL		; Dateiname nach DE
+	CALL	PFAD		; evtl. Pfad einstellen
+	RET	C		; Pfad fehlerhaft
+	EX	DE,HL
+	CALL	UNAME		; Name 8.3 konvertieren und ablegen
+	CALL	TESTX		; Ermittlung Dateigroesse (DEBC)
+	RET	C		; Datei nicht vorhanden
+OPEN1:	LD	A,OPR		; Open/read
+CLF1:	CALL	PUTX
+	LD	A,' '
+	CALL	PUTX
+	CALL	OUTNAM		; Dateiname
+	RET	C
+	JP	EXEC		; Kommando ausfuehern
+
+;							================
+; geoeffnete Datei schliessen				USER-Funktion 12
+;							================
+; PE:	-
+; PA:	CY=0	OK
+;	CY=1	Fehler
+;	DE	Fehlercode, wenn CY=1
+; VR:	AF, (DE bei Fehler)
+;
+CLOSE:
+if tast
+	INTOF			; File-Mode
+endif
+	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+	LD	A,CLF		; Close File
+	JR	CLF1		; weiter wie beim Oeffnen der Datei
+
+;							===============
+; Ein Datenbyte aus Datei lesen				USER-Funktion 6
+;							===============
+; PE:	-
+; PA:	CY=0	OK, dann
+;	A	gelesenes Datenbyte
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+; VR:	AF,BC, (DE nur bei Fehler)
+;
+READ1:
+if tast
+	INTOF			; File-Mode
+endif
+	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+	LD	BC,1		; ein Byte lesen
+READX:	LD	A,RDF		; Read from File
+	CALL	PUTX
+	LD	A,' '
+	CALL	PUTX
+	XOR	A
+	CALL	PUTX
+	XOR	A
+	CALL	PUTX
+	LD	A,B		; Anzahl High
+	CALL	PUTX
+	LD	A,C		; Anzahl Low
+	CALL	PUTX
+	LD	A,CR		; Kommandoabschluss
+	CALL	PUTX
+RDX1:	CALL	GETX		; Datenbyte holen
+	PUSH	AF		; Datenbyte merken
+	DEC	BC		; Anzahl - 1
+	LD	A,B
+	OR	C		; letztes Byte?
+	JR	Z,RDX2		; ja
+	POP	AF
+	LD	(HL),A		; in Speicher ablegen
+	INC	HL
+	JR	RDX1
+; das letzte oder einzige Byte wird nicht im Speicher abgelegt
+RDX2:	CALL	PRMT		; Prompt bzw. Fehlercode abholen
+	JR	C,RDX3		; Fehler
+	POP	AF		; Datenbyte, CY=0
+	RET
+	;
+RDX3:	POP	AF		; Datenbyte
+	SCF			; Fehlerflag setzen
+	RET
+;							===============
+; Mehrere Datenbytes aus Datei lesen			USER-Funktion 7
+;							===============
+; PE:	HL	Adresse zur Ablage der Daten
+;	BC	Anzahl
+; PA:	CY=0	OK, dann
+;	HL = HL+BC-1
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+; VR:	AF,BC,HL, (DE nur bei Fehler)
+;
+READN:
+if tast
+	INTOF			; File-Mode
+endif
+	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+	CALL	READX		; Datenbytes lesen und in Speicher schreiben
+	LD	(HL),A		; letztes Byte ebenfalls
+	RET
+;							===============
+; Neue Datei zum Schreiben oeffnen			USER-Funktion 8
+; Falls Datei existiert, wird Inhalt ueberschrieben	===============
+;
+; PE:	HL	Zeiger auf Dateiname (Null-terminierter String)
+;
+; PA:	CY=0	OK
+;	CY=1	Fehler
+;	DE	Fehlercode, wenn CY=1
+;
+; VR:	AF,BC,DE,HL
+;
+CREATE:	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+	CALL	APP1		; Datei zum Schreiben oeffnen
+	RET	C		; Fehler beim Oeffnen
+	LD	A,SEK		; Seek (Dateizeiger setzen)
+	CALL	PUTX
+	LD	A,' '		; Leerzeichen zwischen Kommando und Position
+	LD	B,5
+CRE1:	CALL	PUTX
+	XOR	A		; 4x 00h als Dateizeiger anhaengen
+	DJNZ	CRE1
+	JP	EXEC		; Kommando ausfuehern
+	
+;							===============
+; Datei zum Schreiben oeffnen				USER-Funktion 9
+; Falls Datei existiert, werden Daten angefuegt		===============
+;
+; PE:	HL	Zeiger auf Dateiname (Null-terminierter String)
+;
+; PA:	CY=0	OK
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+;
+; VR:	AF,BC,DE,HL
+;
+APPEND:	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+APP1:	CALL	usync		; Synchronisieren, File-Mode, SCS, IPH
+	RET	C		; TimeOut oder Error
+	EX	DE,HL		; Dateiname nach DE
+	CALL	PFAD		; evtl. Pfad einstellen
+	RET	C		; Pfad fehlerhaft
+	EX	DE,HL
+	CALL	UNAME		; Name 8.3 konvertieren und ablegen
+APP2:	LD	A,OPW		; Open/write
+	CALL	PUTX
+	LD	A,' '		; Leerzeichen zwischen Kommando und Dateiname
+	CALL	PUTX
+	CALL	OUTNAM		; Dateiname
+	RET	C
+	LD	A,' '		; Leerzeichen zwischen Dateiname und Datum
+	CALL	PUTX
+	CALL	DCONV		; Datum holen vom D004/D008 falls moeglich
+	LD	HL,DATUM
+	LD	B,4		; 32 Bit
+APP3:	LD	A,(HL)
+	INC	HL
+	CALL	PUTX
+	DJNZ	APP3
+	JP	EXEC		; Kommando ausfuehern
+
+;							================
+; Ein Datenbyte in Datei schreiben			USER-Funktion 10
+;							================
+; PE:	A	zu schreibendes Datenbyte
+; PA:	CY=0	OK
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+; VR:	AF,BC, (DE nur bei Fehler)
+;
+WRITE1:
+if tast
+	INTOF			; File-Mode
+endif
+	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+	LD	BC,1		; ein Byte schreiben
+	LD	D,A		; Datenbyte
+WRITEX:	LD	A,WRF		; Write to File
+	CALL	PUTX
+	LD	A,' '
+	CALL	PUTX
+	XOR	A
+	CALL	PUTX
+	XOR	A
+	CALL	PUTX
+	LD	A,B		; Anzahl High
+	CALL	PUTX
+	LD	A,C		; Anzahl Low
+	CALL	PUTX
+	LD	A,CR		; Kommandoabschluss
+	CALL	PUTX
+WRX1:	LD	A,D
+	CALL	PUTX		; Datenbyte schreiben
+	DEC	BC
+	LD	A,B
+	OR	C		; letztes Byte?
+	JP	Z,PRMT		; ja
+	INC	HL		; naechstes Byte
+	LD	D,(HL)		; aus Speicher lesen
+	JR	WRX1
+
+;							================
+; Mehrere Datenbytes aus Datei lesen			USER-Funktion 11
+;							================
+; PE:	HL	Adresse zur Ablage der Daten
+;	BC	Anzahl
+; PA:	CY=0	OK, dann
+;	HL = HL+BC-1
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+; VR:	AF,BC,HL,D (E nur bei Fehler)
+;
+WRITEN:
+if tast
+	INTOF			; File-Mode
+endif
+	PUSH	HL		; HL sichern
+	LD	HL,TEST7	; Bei Rueckkehr CAOS-Mode (keine Fehleranzeige)
+	EX	(SP),HL		; als RET-Adresse auf Stack legen
+	LD	D,(HL)		; erstes Datenbyte aus Speicher
+	JR	WRITEX		; Datenbytes aus Speicher schreiben
+
+;							================
+; FindFirst - erster Verzeichniseintrag			USER-Funktion 13
+;							================
+; PE:	HL	Maske (Pfad moeglich)
+; PA:	CY=0	OK, Dateiname in Kassettenpuffer (IX+5/6)
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+;	(NUMVX)	Anzahl der gefundenen Dateien
+; VR:	AF,BC,DE,HL
+;
+FFIRST:
+if tast
+	LD	A,(MODE)
+	AND	0Ch		; Bit 2+3 (Interruptmode) testen
+	JR	Z,FIND1		; CAOS-Mode: OK
+FIND0:	LD	DE,'MD'		; Fehlercode "falsche Betriebsart"
+	SCF			; Fehlerflag
+	RET
+	;
+FIND1:
+endif
+	EX	DE,HL		; Maske nach DE
+	LD	HL,0
+	ld	(NUMVX),HL	; Zaehler fuer passende Dateien
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	RET	C		; Fehler
+	CALL	PFAD		; evtl. Dateipfad einstellen
+	RET	C		; Pfad fehlerhaft
+	EX	DE,HL		; Maske in HL
+	LD	DE,CASS+115	; oberes Ende des Kassettenpuffers
+	LD	BC,12		; max. Laenge (8.3 mit Punkt)
+	LDIR			; in Kassettenpuffer ablegen
+	XOR	A		; Ende-0
+	LD	(DE),A		; als Abschluss anhaengen
+	LD	A,DIR		; DIR-Kommando
+	CALL	PUTX
+	LD	A,CR		; ohne Parameter
+	CALL	PUTX
+	call	GETX		; 1. Zeichen holen
+	CP	CR		; wenn kein Vinculum-Fehler dann kommt ein CR
+	JR	Z,FIND3
+	CALL	GETERR		; Fehlercode abholen
+FIND2:
+if tast
+	CALL	MODE3		; Interrupt: CAOS-Mode
+endif
+	SCF
+	RET
+;							================
+; FindNext - naechster Verzeichniseintrag		USER-Funktion 14
+;							================
+; PA:	CY=0	OK, Dateiname in Kassettenpuffer
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+; VR:
+;
+FNEXT:
+if tast
+	LD	A,(MODE)
+	AND	0Ch		; Bit 2+3 (Interruptmode) testen
+	CP	4
+	JR	NZ,FIND0	; falsche Betriebsart!
+endif
+FIND3:	LD	L,(IX+5)	; Ablage der Dateinamen
+	LD	H,(IX+6)	; im Kassettenpuffer (Anfang)
+FIND4:	CALL	GETX		; Zeichen holen
+	LD	(HL),A
+	INC	HL
+	SUB	CR		; Zeile fertig?
+	JR	NZ,FIND4
+	DEC	HL
+	LD	(HL),A		; Ende-0 anhaengen
+	LD	L,(IX+5)	; Eintrag
+	LD	H,(IX+6)	; im Kassettenpuffer
+	LD	A,(HL)		; erstes Zeichen
+	CP	'>'
+	JR	NZ,FIND5	; kein Prompt
+	INC	HL
+	LD	A,(HL)		; zweites Zeichen
+	DEC	HL
+	OR	A
+	JR	NZ,FIND5	; kein Prompt
+	LD	DE,'DE'		; Fehlercode "DirEnd"
+	JR	FIND2
+	;
+FIND5:	LD	DE,CASS+115	; abgespeicherte Maske
+	LD	A,(DE)
+	AND	A
+	CALL	NZ,GLOB		; Vergleich mit Maske, falls vorhanden
+	JR	C,FIND3		; passt nicht zu Maske
+	LD	HL,(NUMVX)
+	INC	HL		; Eintraege mitzahlen
+	LD	(NUMVX),HL
+	RET
+
+;*******************************************************************************
+;	CAOS 4.6 - USB-Treiber fuer M052
+;*******************************************************************************
+
+; liest und schreibt nur volle 128-Byte-Bloecke, so wie CAOS das verlangt.
+; d.h. beim Einlesen von Dateien mit einem kuerzeren letzten Block, erhaelt
+; man einen CF-ERROR
+
+;
+; Initialisierung Eingabe, einlesen 1. Block		** 0A **
+;
+; PE:	(IX+5/6)	Pufferanfang
+;	HL		Dateiname (Pfad moeglich)
+; PA:	(IX+2)		gelesene Blocknummer
+;	CY=1		Fehler, dann
+;	DE		Fehlercode, wenn CY=1
+; VR:	AF,BC, (DE im Fehlerfall)
+;
+UISRI:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+	PUSH	HL
+	PUSH	DE
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	JR	C,MBIERR	; TimeOut oder Error
+	EX	DE,HL		; Dateiname nach DE
+	CALL	PFAD		; evtl. Pfad einstellen
+	JR	C,UMBI3		; Pfad fehlerhaft
+	EX	DE,HL
+	CALL	UNAME		; Name 8.3 konvertieren und ablegen
+	CALL	UOPENR		; Datei zum Lesen oeffnen
+	JR	C,MBIERR	; TimeOut oder Error
+;	CALL	EXEC
+;	JR	C,MBIERR	; Error
+	JR	UMBI1		; ersten Block lesen
+;
+; Datenblock einlesen					** 05 **
+;
+; PE:	(IX+3)		erwartete Blocknummer
+;	(IX+5/6)	Pufferanfang
+; PA:	CY=1		Fehler
+;	(IX+2)		gelesene Blocknummer
+;	DE	Fehlercode, wenn CY=1
+; VR:	AF,BC, (DE im Fehlerfall)
+;
+UMBI:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+if tast
+	INTOF			; File-Mode
+endif
+	PUSH	HL
+	PUSH	DE
+UMBI1:	LD	L,(IX+5)
+	LD	H,(IX+6)	; Blockpuffer
+	CALL	RD128		; Datenblock 128 Byte lesen
+MBIERR:	JR	C,UMBI3		; Fehler
+	POP	DE
+	DB	3EH	; LD A, 0E5H statt POP	HL
+UMBI3:	POP	HL		; im Fehlerfall DE nicht regenerieren,
+	POP	HL		; da dort der Fehlercode drin ist.
+	RET
+;
+; UP abschliessen, bei Bedarf Fehlercode anzeigen, CAOS-Mode
+; Klartextanzeige bei	TimeOut, FileEnd und Break
+; VR:	-
+;
+CMODE:
+if tast
+	PUSH	AF
+	CALL	MODE3		; Interrupt: CAOS-Mode
+	POP	AF
+endif
+ERR:	RET	NC		; kein Fehler
+;Fehlercode anzeigen:
+ERRX:	PUSH	AF
+	LD	A,E
+	CP	'O'
+	LD	A,D
+	JR	NZ,ERR1		; nicht TimeOut
+	CP	'T'
+	JR	NZ,ERR1		; nicht TimeOut
+
+Timout:	; TO-Error im Klartext anzeigen!
+	CALL	PV1
+	DB	OSTR
+	DB	'TimeOut',0
+	JR	ERR4
+	;
+ERR1:	LD	A,E
+	CP	'E'
+	LD	A,D
+	JR	NZ,ERR2		; nicht Dateiende
+	CP	'F'
+	JR	NZ,ERR2		; nicht Dateiende
+	CALL	PV1
+	DB	OSTR
+	DB	'FileEnd',0
+	JR	ERR4
+	;
+ERR2:	LD	A,E
+	CP	'K'
+	LD	A,D
+	JR	NZ,ERR3		; nicht Abbruch
+	CP	'B'
+	JR	NZ,ERR3		; nicht Abbruch
+	CALL	PV1
+	DB	OSTR
+	DB	'Break',CR,LF,0
+	POP	AF
+	RET
+	;
+ERR3:	CALL	CRTX		; erstes Zeichen vom Fehlercode
+	LD	A,E
+	CALL	CRTX		; zweites Zeichen vom Fehlercode
+ERR4:	LD	A,'-'
+	CALL	CRTX		; Trennung
+	CALL	PV1
+	DB	ERRM		; ERROR, CR,LF
+	POP	AF
+	RET
+;
+; Eingabedatei schliessen				** 0B **
+;
+; PE:	-
+; PA:	CY=1	Fehler
+;	DE	Fehlercode, falls CY=1
+; VR:	AF (DE im Fehlerfall)
+;
+UCSRI:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+if tast
+	INTOF			; File-Mode
+endif
+	PUSH	HL
+	CALL	UCLOSE		; geoeffnete Datei schliessen
+	POP	HL
+	RET
+;
+; Initialisierung Ausgabe, ausgeben 1. Block		** 08 **
+;
+; PE:	BC		Laenge Vorton
+;	(IX+5/6)	Pufferadresse
+;	HL		Dateiname (Pfad moeglich)
+; PA:	HL		Pufferende+1
+;	CY=1		Fehler
+;	DE	Fehlercode, wenn CY=1
+;	DE	Pufferende+1 wenn CY=0
+;	(IX+2)		Blocknummer
+; VR:	AF,BC,DE,HL
+;
+UISRO:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	RET	C		; TimeOut oder Error
+	EX	DE,HL		; Dateiname nach DE
+	CALL	PFAD		; evtl. Pfad einstellen
+	RET	C		; Pfad fehlerhaft
+	EX	DE,HL
+	CALL	UNAME		; Name 8.3 konvertieren und ablegen
+	CALL	UTEST		; Test ob Datei bereits vorhanden ist
+	RET	C		; Abbruch oder Fehler
+	CALL	UOPENW		; Datei zum Schreiben oeffnen
+;	CALL	EXEC
+	RET	C		; Error
+if tast
+	JR	UMBO1
+endif
+;
+; Datenblock ausgeben					** 01 **
+;
+; PE:	BC		Laenge Vorton
+;	(IX+2)		Blocknummer-1
+;	(IX+5/6)	Pufferadresse
+; PA:	HL		Pufferende+1
+;	CY=1		Fehler
+;	DE	Fehlercode, wenn CY=1
+;	DE	Pufferende+1 wenn CY=0
+;	(IX+2)		Blocknummer
+; VR:	AF,BC,DE,HL
+;
+UMBO:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+if tast
+	INTOF			; File-Mode
+endif
+UMBO1:	LD	L,(IX+5)
+	LD	H,(IX+6)	; Blockpuffer
+;
+; Datenblock schreiben (128 Byte)
+;
+; PE:	HL	Adresse
+;
+; PA:	HL	HL+80H
+;	CY=1	Fehler, dann Fehlercode in DE
+;
+; VR:	HL,DE,AF,B
+;
+WR128:	PUSH	BC
+	INC	(IX+2)		; naechster Block
+	LD	BC,128		; 128 Byte schreiben
+	LD	D,(HL)		; erstes Byte aus Speicher
+	CALL	WRITEX		; BC Byte speichern
+	INC	HL
+	POP	BC
+	RET	C		; Ende mit Fehlercode
+	LD	E,L
+	LD	D,H		; DE=HL (Pufferende+1)
+	RET
+;
+; Ausgabe abschliessen, Ausgabe letzter Block (FF)	** 09 **
+;
+; PE:	BC		Laenge Vorton
+;	(IX+2)		Blocknummer-1
+;	(IX+5/6)	Pufferadresse
+; PA:	HL		Pufferende+1
+;	CY=1		Fehler
+;	DE	Fehlercode, wenn CY=1
+;	DE	Pufferende+1 wenn CY=0
+;	(IX+2)		Blocknummer 0FFH
+; VR:	AF,BC,DE,HL
+;
+UCSRO:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+if tast
+	INTOF			; File-Mode
+	LD	(IX+2),0FEH	; letzter Block
+	CALL	UMBO1		; Block ausgeben
+	RET	C		; Error
+	JP	UCLOSE		; geoeffnete Datei schliessen
+else
+	LD	(IX+2),0FEH	; letzter Block
+	CALL	UMBO		; Block ausgeben
+	RET	C		; Error
+	JP	UCLOSE		; geoeffnete Datei schliessen
+endif
+;
+; Dateiname aus Puffer holen, bei NAME ablegen und konvertieren
+; PE:	HL	Zeiger auf Dateiname
+;	Format 8.3:	"12345678.ABC" oder auch "12345678ABC"
+; PA:	NAME	abgelegt auf vereinbartem Speicherplatz
+; VR:	HL,DE,B
+;
+UNAME:	ld	de,NAME		; Ablage Dateiname
+	ld	b,8		; bis zu 8 Zeichen fuer Dateiname
+	CALL	UN1		; Dateiname uebernehmen
+	ld	a,(hl)
+	cp	'.'		; Trennzeichen nach 8 Zeichen?
+	jr	nz,UN4
+	inc	hl		; uebergehen
+UN4:	ld	b,3		; bis zu 3 Zeichen fuer Dateityp
+	CALL	UN1		; Dateityp uebernehmen
+	;
+	LD	HL,NAME+8	; Dateityp ueberpruefen
+	LD	A,(HL)
+	CP	' '		; Dateityp leer?
+	RET	NZ		; nein
+; Falls kein Dateityp angegeben, dann .KCC eintragen
+	LD	HL,NAME+8
+	ld	(hl),'K'	; in .KCC umwandeln
+	inc	hl
+	ld	(hl),'C'
+	inc	hl
+	ld	(hl),'C'
+	RET
+	;
+UN1:	ld	a,(hl)
+	AND	7Fh		; Bit 7 ruecksetzen
+	cp	21h		; Leerzeichen, Steuerzeichen oder Ende-0?
+	jr	c,UN2
+	inc	hl
+	cp	'.'		; Trennzeichen zu Dateityp?
+	jr	z,UN2
+	ld	(de),a		; Zeichen uebernehmen
+	inc	de
+	djnz	UN1
+	RET
+	;
+UN2:	ld	a,' '		; Rest von Dateiname
+	cp	(hl)		; Name/Typ eventuell mit Leerzeichen getrennt?
+	jr	nz,UN3		; nein
+	inc	hl		; sonst auch dieses uebergehen
+UN3:	ld	(de),a		; Rest von Dateiname mit Leerzeichen fuellen
+	inc	de
+	djnz	UN2
+	RET
+;
+; BASIC-Dateiname ab NAME im Format 8.3 kopieren
+;
+; PE:	HL	Zeiger auf Dateiname im BASIC-Format = SSSName
+;
+; PA:	NAME	Dateiname 8.3-Format = Name.SSS
+;
+; VR:	HL,BC
+;
+BNAME:	BIT	3,D		; Init?
+	RET	Z
+	PUSH	DE
+	PUSH	AF
+	push	hl		; Beginn Dateityp merken
+	inc	hl
+	inc	hl
+	inc	hl		; mit Name beginnen
+	ld	de,NAME
+	ld	bc,8
+	ldir			; Name direkt kopieren
+	pop	hl
+	ld	b,3
+bnam2:	ld	a,(hl)
+	inc	hl
+	and	7fh		; bei Dateityp Bit 7 ruecksetzen
+	ld	(de),a
+	inc	de
+	djnz	bnam2
+	pop	af
+	pop	de
+	ret
+
+;-------------------------------------------------------------------------------
+; Programmteile die direkt im ROM abgearbeitet werden koennen
+;-------------------------------------------------------------------------------
+
+; Byte-Eingabe vom USB-Stick:	(CAOS-UP Nr. 37H - nur fuer CAOS 4.6)
+;				(und fuer UBASEX bis CAOS 4.5)
+; liest Daten blockweise ein und entnimmt Daten dann byteweise aus dem Puffer
+;
+; PE:	D	Steuerbyte	Bit3=1 -> INIT (1. Block)
+;				Bit6=1 -> CLOSE (letzter Block)
+;	HL	Zeiger auf Name (11 Byte) bei INIT
+;
+; PA:	A	Datenbyte
+;	CY=1	IO-Error
+;	DE	Fehlercode, wenn CY=1
+;
+; VR:	AF,BC,DE,HL
+
+UMBIN:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+if tast
+	INTOF			; File-Mode
+endif
+	CALL	BNAME		; bei Open: Dateiname merken
+	BIT	6,D		; Close?
+	JP	NZ,MBOC4	; ja, Datei schliessen
+	BIT	3,D		; Init?
+	JR	Z,MBINC3	; nein
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	RET	C		; TimeOut oder Error
+	CALL	UOPENR		; Datei zum Lesen oeffnen
+	RET	C		; Error
+;	CALL	EXEC
+;	RET	C		; Error
+MBINC1:	LD	HL,CASS		; Ziel=Kassettenpuffer
+	CALL	RD128		; Datenblock 128 Byte lesen
+	RET	C		; Error
+	CALL	BLNR		; Blocknummer anzeigen
+	LD	HL,CASS
+MBINC2:	LD	D,(HL)		; Datenbyte aus Puffer lesen
+	INC	L
+	LD	A,L
+	LD	(DTPTR),A	; neuen Pointer setzen
+	LD	A,D
+	AND	A		; CY=0 -> OK
+	RET
+	;
+MBINC3:	LD	HL,(DTPTR)	; Pointer
+	LD	H,high(CASS)	; in Puffer
+	BIT	7,L		; 80H?
+	JR	Z,MBINC2	; Byte aus Puffer holen
+	INC	(IX+3)		; naechsten Block erwarten
+	JR	MBINC1
+
+; Byte-Ausgabe zum USB-Stick:	(CAOS-UP Nr. 38H - nur fuer CAOS 4.6)
+;				(und fuer UBASEX bis CAOS 4.5)
+; schreibt Daten byteweise in Puffer und schreibt sie dann blockweise auf Stick
+; PE:	A	Datenbyte
+;	D	Steuerbyte	Bit3=1 -> INIT (1. Block)
+;				Bit6=1 -> CLOSE (letzter Block)
+;	HL	Zeiger auf Name (11 Byte) bei INIT
+;
+; PA:	CY=1	IO-Error
+;	DE	Fehlercode, wenn CY=1
+;
+; VR:	AF,BC,DE,HL
+;
+UMBOUT:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+	CALL	BNAME		; bei Open: Dateiname merken
+	LD	E,A		; Datenbyte merken
+	BIT	3,D		; Init?
+	JR	Z,MBOC5		; nein
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	RET	C		; TimeOut oder Error
+	PUSH	DE
+	CALL	UTEST		; Test ob Datei bereits vorhanden ist
+	POP	DE
+	RET	C		; Abbruch oder Fehler
+	PUSH	DE
+	CALL	UOPENW		; Datei zum Schreiben oeffnen
+	POP	DE
+	RET	C		; Error
+	CALL	CLC		; Kassettenpuffer loeschen
+MBOC2:	LD	(HL),E		; Datenbyte eintragen
+	BIT	6,D		; Close?
+	JR	NZ,MBOC3	; ja, restliche Daten schreiben!
+	INC	L
+	LD	A,L
+	AND	7FH
+	LD	(DTPTR),A	; Pointer neu setzen
+	RET	NZ		; Puffer noch nicht voll
+MBOC3:
+if tast
+	INTOF			; File-Mode
+endif
+	LD	L,0
+	push	de
+	CALL	WR128		; Pufferinhalt schreiben
+	jr	nc,mboc6	; kein Fehler
+	pop	hl		; Fehlercode in DE erhalten
+	RET			; Error
+mboc6:	pop	de
+	CALL	BLNR		; Blocknummer anzeigen
+	CALL	CLC		; Kassettenpuffer loeschen
+	BIT	6,D		; Close?
+	RET	Z		; nein
+;	SET	0,(IX+8)	; Taste gedrueckt, fuer Verify?
+MBOC4:	JP	UCLOSE		; geoeffnete Datei schliessen
+	;
+MBOC5:	LD	HL,(DTPTR)	; Pointer
+	LD	H,high(CASS)	; in Puffer
+	JR	MBOC2		; Byte in Puffer schreiben
+;
+; Kassettenpuffer loeschen:
+; PA:	HL = CASS
+;
+CLC:	LD	HL,CASS+80H
+	XOR	A
+CLC1:	DEC	L
+	LD	(HL),A
+	JR	NZ,CLC1
+	RET
+;
+; USB-Treiber Funktion 0: Directory mit Maske
+; PE:	DE	Maske (Pfad moeglich)
+; PA:	CY=1	Fehler
+;	HL	Anzahl passender Eintraege
+;	DE	Fehlercode
+; VR:	AF, BC, DE, HL
+;
+UDIR:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	RET	C		; Fehler
+	CALL	PFAD		; evtl. Dateipfad einstellen
+	RET	C		; Pfad fehlerhaft
+UDIR1:	EX	DE,HL		; Maske aus Kommandozeile
+	LD	DE,CASS
+	LD	BC,12		; max. Laenge (8.3 mit Punkt)
+	LDIR			; In Kassettenpuffer ablegen
+	XOR	A
+	LD	(DE),A		; Abschluss Maske
+	LD	(NUMNX),A	; Zeilenzaehler fuer Anzeige
+	ld	hl,0
+	ld	(NUMVX),hl	; Zaehler fuer angezeigte Dateien
+	ld	a,dir		; DIR-Kommando ausfuehren
+	CALL	PUTX
+	ld	a,cr		; ohne Parameter
+	CALL	PUTX
+	call	GETX		; 1. Zeichen holen
+	cp	cr		; wenn kein Vinculum-Fehler dann kommt ein CR
+	jp	nz,GETERR	; sonst Fehlercode abholen
+UD1:	ld	hl,CASS+13+12	; Ende fuer Ablage Eintrag
+	ld	de,CASS+13+11
+	LD	BC,12		; max. Laenge (8.3 mit Punkt)
+	LD	(HL),' '	; Leerzeichen
+	LDDR			; fuer gesamten Eintrag vorbelegen
+	LD	E,20		; max. Puffergroesse
+UD2:	call	GETX		; Zeichen holen
+	ld	c,a
+	CP	'.'
+	jr	z,UD3		; Trennzeichen Dateien
+	cp	' '		; oder Trennung DIR-Eintrag
+	jr	z,UD4
+	jr	UD5
+; Behandlung Trennzeichen...
+UD3:	ld	a,l
+	cp	13		; erstes Zeichen?
+	jr	z,UD5		; kann auch ein Punkt sein!
+	ld	a,(CASS+13)
+	CP	'.'		; erstes Zeichen ein Punkt?
+	jr	z,UD5		; dann auch ein weiterer moeglich!
+UD4:	LD	HL,CASS+13+8	; Position Trennzeichen
+UD5:	ld	(hl),c		; Zeichen ablegen
+	ld	a,c
+	cp	cr
+	jr	z,UD6		; CR erkannt, Zeile ist komplett eingelesen
+	inc	hl
+	DEC	E
+	JR	NZ,UD2		; weiter bis Puffer voll ist
+
+UD6:	ld	a,(CASS+13)	; erstes Zeichen
+	cp	cr
+	jr	z,UD1		; Leerzeile -> ignorieren
+	cp	'>'
+	jr	z,UD7		; Prompt erkannt -> fertig (Zaehler anzeigen)
+
+; DIR-Eintrag anzeigen:
+
+	LD	(HL),' '	; Leerzeichen statt CR
+	LD	HL,CASS+13+12
+	LD	(HL),0		; Ende-0 nach Dateityp (feste Breite)
+	LD	HL,CASS+13
+	LD	DE,CASS		; Maske
+	LD	A,(DE)
+	AND	A
+	CALL	NZ,GLOB		; Vergleich mit Maske, falls vorhanden
+	jr	c,UD1		; passt nicht zu Maske
+	LD	A,(CURSO)
+	CP	3*13		; nach 3. Eintrag neue Zeile!
+	CALL	Z,NL
+	LD	HL,CASS+13
+	CALL	PV1
+	DB	ZKOUT		; Eintrag anzeigen
+	CALL	PV1
+	DB	SPACE		; Leerzeichen dazwischen
+	ld	hl,(NUMVX)
+	inc	hl		; mitzaehlen
+	ld	(NUMVX),HL
+	jr	UD1		; weiter suchen
+
+; Abschluss DIR-Kommando:
+
+UD7:	LD	A,(CURSO)
+	AND	A		; Stehen wir am Zeilenanfang?
+	CALL	NZ,NL		; nein, dann neue Zeile
+	ld	hl,(NUMVX)
+	push	hl
+	call	HLDEZI		; Anzahl dezimal anzeigen
+	call	pv1
+	DB	ostr
+	DB	' Dateien/Verzeichnisse.',CR,LF,0
+	pop	hl
+	RET
+
+; Neue Zeile bei DIR-Kommando / warten nach Bildschirmseite:
+
+NL:	LD	HL,NUMNX	; Zeilenzaehler
+	INC	(HL)		; Zeilen zaehlen
+	LD	A,(WINLG+1)	; Anzahl Zeilen im Fenster
+	DEC	A		; eine Zeile zum ueberlappen der Anzeige lassen
+	SUB	(HL)
+	JR	NZ,LFCR
+	LD	(HL),A		; wieder von vorn zaehlen
+
+if tast		; spezielle Schleife aehnlich KBD mit Polling USB-Tastatur
+	LD	L,0
+KBD1:	CALL	PV1
+	DB	CUCP		; CUCP - blinken
+	INC	L		; e/a-Merker
+	LD	DE,1800		; Zeitkonstante fuer Blinkfrequenz
+KBD2:	CALL	PV1
+	DB	KBDZ		; abfragen
+	JR	C,KBD3		; Taste gedrueckt
+	IN	A,(PIO52B)	; liegen Daten von USB-Tastatur an?
+	BIT	5,A		; (Bit 5 ist dann Low)
+	CALL	Z,LOOP1		; ja, Tastencode abholen
+	DEC	DE
+	LD	A,D
+	OR	E
+	JR	NZ,KBD2		; warten,
+	JR	KBD1		; dann Cursor wieder weg usw.
+	;
+KBD3:	BIT	0,L		; gerade ein?
+	JR	Z,LFCR
+	CALL	PV1
+	DB	CUCP		; Cursor wegnehmen
+else
+	call	pv1
+	db	kbd		; Tastatureingabe abwarten
+endif
+LFCR:	PUSH	AF
+	CALL	PV1
+	DB	CRLF
+	POP	AF
+	RET
+
+; Vergleich mit DIR-Maske: (Routine 1:1 in CAOS enthalten)
+
+MAT0:	INC	HL
+MAT0E:	INC	DE
+GLOB:	; Eintritt, HL=Name, DE=Maske
+	; PA: CY=1: nicht gefunden
+	LD	A,(DE)
+	OR	(HL)		; Beide Ende?
+	RET	Z		; -> OK
+	LD	A,(DE)		; Maske
+	CP	'*'		; Joker?
+	JR	Z,MAT0S
+	CP	1
+	RET	C		; Maske Ende
+	LD	A,(HL)
+	CP	1
+	RET	C		; Name Ende
+	LD	A,(DE)
+	CP	'?'
+	JR	Z,MAT0		; einzelnes Joker-Zeichen
+	BIT	5,(HL)
+	CALL	Z,UPCASE
+	CP	(HL)
+	JR	Z,MAT0
+	SCF
+	RET
+	;
+MAT0S:	PUSH	HL
+	PUSH	DE
+	CALL	MAT0E		; Rekursion!
+	POP	DE
+	POP	HL
+	RET	NC		; -> OK
+	LD	A,(HL)
+	INC	HL
+	OR	A
+	JR	NZ,MAT0S
+	SCF
+	RET
+
+; Kleinbuchstaben in A in Grossbuchstaben umwandeln:
+
+UPCASE:	CP	'a'
+	RET	C
+	CP	'z' + 1
+	RET	NC
+	AND	11011111b
+	RET
+;
+; USB-Treiber Funktion 9: Laufwerkwechsel
+; PE:	DE	Zeichenkette mit Dateipfad, zum Beispiel:
+;	"/"			Wurzelverzeichnis
+;	".."			eine Ebene hoeher
+;	"pfad"			direkt in Unterverzeichnis
+;	"/dir"			absoluter Pfad 
+;	"dir1/dir2"		relativer Pfad
+;	"\dir1\dir2\"		absoluter Pfad beginnt mit Slash
+;	"dir1\dir2\"		relativer Pfad
+;	"/verz1/verz2/"		absoluter Pfad beginnt mit Backslash
+;	"verz1/verz2"		relativer Pfad
+; PA:	CY=1	Fehler
+;	DE	Fehlercode, falls CY=1
+;
+UCD:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	RET	C		; Fehler
+
+; Test, ob Verzeichnisname angegeben wurde, wenn nicht: UDIR *.DIR
+; und dann zur Eingabe des Namen auffordern
+
+	ld	a,(de)
+	and	a		; Pfadangabe vorhanden?
+	jr	nz,ucd1		; ja
+	LD	DE,DIRSTR
+	CALL	UDIR1		; Unterverzeichnisse anzeigen
+	CALL	PV1
+	DB	OSTR
+	DB	2,'Verzeichnis:',0
+	CALL	INPUT		; Eingabe
+	CCF
+	RET	NC		; BRK ab CAOS 4.3 (ohne Fehleranzeige)
+	ld	hl,12
+	add	hl,de		; zu erster Eingabeposition
+	ld	a,(hl)
+	and	a		; Leer?
+;	scf			; dann Fehlerflag setzen
+	ret	z		; und Ende
+	ex	de,hl		; ansonsten Eingabe verwenden
+ucd1:	CALL	PFAD		; Pfad einstellen, Zeiger auf Rest in HL
+	RET	C		; Fehler
+	LD	A,(DE)		; folgt noch etwas?
+	AND	A
+	RET	Z		; nein, fertig
+; Rest auch als Pfad interpretieren
+SET_DIR:
+	ld	b,-1		; maximale Anzahl Zeichen
+SET_DIR1:
+	ld	a,cd		; CD-Kommando
+	call	PUTX
+	ld	a,' '		; Leerzeichen dazwischen
+	call	PUTX
+ucd2:	ld	a,(de)		; Zeichenkette abarbeiten
+	or	a
+	jr	z,ucd3		; Kommandoabschluss
+;	cp	2fh
+;	jp	z,exec
+;	cp	5ch
+;	jp	z,exec
+	call	PUTX		; und Pfad uebergeben
+	inc	de
+	djnz	ucd2
+ucd3:	jp	EXEC		; Kommandoabschluss
+	;
+DIRSTR:	DB	'*DIR',0	; Maske, um nur Verzeichnisse anzuzeigen
+;
+; Pfad einstellen nach Idee von Jens Mueller:
+;
+; Diese Funktion stellt anhand eines vollstaendigen Dateinamen den Pfad ein
+; und gibt den eigentlichen Dateinamen ohne Pfad zurueck.
+; Pfadtrennezeichen koennen Slash(/) und Backslash (\) sein.
+; Enthaelt der uebergebene Dateiname kein Pfadtrennzeichen,
+; hat die Funktion keine Wirkung und gibt den uebergebenen Dateinamen
+; wieder zurueck.
+;
+; Diese Funktion darf darf nur im File/User-Mode aufgerufen werden.
+;
+; PE:	DE=Zeiger auf einen Dateinamen mit oder ohne Pfadangabe, z.B:
+;	"\dir1\dir2\datei.txt"		absoluter Pfad beginnt mit Slash
+;	"dir1\dir2\datei.txt"		relativer Pfad
+;	"/verz1/verz2/datei.txt"	absoluter Pfad beginnt mit Backslash
+;	"verz1/verz2/datei.txt"		relativer Pfad
+;	"datei.txt"			ohne Pfad
+; PA:	DE=Zeiger auf den eigentlichen Dateinamen ohne Pfad,
+;	im Beispiel ob also "datei.txt"
+;	CY=1	Fehler, dann DE=Fehlercode
+; VR:	AF, B, DE, HL
+;
+PFAD:	LD	A,(DE)			; absolute Pfadangabe?
+	CP	2FH			; beginnend mit Slash
+	JR	Z,PFAD1
+	CP	5CH			; beginnend mit Backslash
+	JR	NZ,PFAD3
+PFAD1:	INC	DE
+	PUSH	DE
+	LD	DE,SLASH		; mit CD /
+	CALL	SET_DIR			; in das oberste Verzeichnis wechseln
+	JR	NC,PFAD2		; kein Fehler
+	POP	HL		; DE erhalten (z.B. ND-ERROR)
+	RET
+	;
+PFAD2:	POP	DE
+
+; in Verzeichnis wechseln
+PFAD3:	LD	H,D			; aktuelle Stringposition merken
+	LD	L,E			; mit HL weiter arbeiten
+	LD	B,-1
+PFAD4:	LD	A,(HL)
+	INC	HL
+	INC	B			; Zeichen mitzaehlen
+	OR	A			; String-Ende?
+	RET	Z			; kein Pfadelement, Rest=Dateiname
+	CP	0DH			; Zeilenendezeichen?
+	JR	Z,PFAD6	; nicht erlaubt: PI-ERROR
+	CP	2FH			; Slash
+	JR	Z,PFAD5
+	CP	5CH			; Backslash
+	JR	NZ,PFAD4
+PFAD5:	XOR	A
+	OR	B			; leeres Pfadelement? (also z.B. "//")
+	JR	Z,PFAD6	; nicht erlaubt: PI-ERROR
+
+	CALL	SET_DIR1		; Pfad (DE) einstellen
+	INC	DE			; Trennzeichen uebergehen
+	JR	NC,PFAD3	; OK, weiter abarbeiten
+
+;ungueltige Pfadangabe, Pfad nicht gefunden
+PFAD6:	LD	DE,'PI'			; Fehlercode "Path Invalid"
+	SCF				; Fehler
+	RET
+
+SLASH:	DB	'/',0
+
+;
+; USB-Treiber Funktion 2: Datei loeschen
+;	(DE)=0	Dateinamen werden abgefragt
+; PE:	DE	Dateiname
+; PA:	CY=1	Fehler
+;	DE	Fehlercode
+;
+UERA:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	RET	C		; Fehler
+	EX	DE,HL
+	LD	A,(HL)		; Parameter in Kommandozeile
+	AND	0DFH		; angegeben?
+	CALL	Z,NAME6		; Dateiname abfragen falls nicht angegeben
+	CCF			; BRK nicht als Fehler anzeigen
+	RET	NC		; Eingabe Dateiname mit BRK abgebrochen
+	EX	DE,HL		; Dateiname nach DE
+	CALL	PFAD		; evtl. Pfad einstellen
+	RET	C		; Pfad fehlerhaft
+	EX	DE,HL		; Dateiname nach HL
+	LD	A,DLF		; Delete File
+	CALL	PUTX
+	JR	UREN5
+;
+; USB-Treiber Funktion 3: Datei umbenennen
+; PE:	DE	Zeiger auf Zeichenkette mit 2 Dateinamen
+;	(DE)=0	Dateinamen werden abgefragt
+; PA:	CY=1	Fehler
+;
+UREN:	FMODE			; Bei Rueckkehr wieder CAOS-Mode
+	CALL	USYNC		; synchronisieren, Short- und HEX-Mode, Filemode
+	RET	C		; Fehler
+	EX	DE,HL
+	LD	A,(HL)		; Parameter in Kommandozeile
+	AND	0DFH		; angegeben?
+	JR	Z,UREN2		; nein, dann per Eingabe abfragen
+	PUSH	HL		; 1. Dateiname auf Stack
+UREN1:	INC	HL		; Suche nach einem 2. Parameter
+	LD	A,(HL)
+	CP	' '		; Trennzeichen zwischen Dateinamen?
+	JR	NZ,UREN1
+	INC	HL
+	LD	A,(HL)		; Parameter in Kommandozeile
+	AND	0DFH		; 2. Dateiname angegeben?
+	JR	NZ,UREN4	; ja, dann diesen verwenden
+	JR	UREN3		; Neuen Dateinamen abfragen
+	;
+UREN2:	CALL	PV1
+	DB	OSTR
+	DB	LF,LF,0BH,0BH	; 2 Zeilen "frei scrollen"
+	DB	'Alter ',0
+	LD	HL,12
+	CALL	NAMHL		; Dateiname abfragen
+	CCF			; BRK nicht als Fehler anzeigen
+	RET	NC		; Eingabe Dateiname mit BRK abgebrochen
+	PUSH	HL		; 1. Dateiname auf Stack
+UREN3:	CALL	PV1
+	DB	OSTR
+	DB	'Neuer ',0
+	LD	HL,12
+	CALL	NAMHL		; Dateiname abfragen
+UREN4:	POP	DE		; 1. Dateiname in DE
+	CCF			; BRK nicht als Fehler anzeigen
+	RET	NC		; Eingabe Dateiname mit BRK abgebrochen
+	PUSH	HL		; 2. Dateiname merken
+	CALL	PFAD		; evtl. Pfad einstellen
+	POP	HL
+	RET	C		; Pfad fehlerhaft
+	LD	A,REN		; Rename File
+	CALL	PUTX
+	LD	A,' '		; Leerzeichen zwischen Kommando und Dateiname
+	CALL	PUTX
+	EX	DE,HL
+	CALL	PUT12		; 1. Dateiname (DE) ausgeben
+	RET	C		; TimeOut
+	EX	DE,HL		; jetzt 2. Dateiname in HL
+UREN5:	LD	A,' '		; Leerzeichen zwischen Kommando und Dateiname
+	CALL	PUTX
+	CALL	PUT12		; Dateiname (HL) ausgeben
+	RET	C
+	CALL	EXEC		; Kommando ausfuehren
+	RET	C		; Fehler
+	CALL	PV1
+	DB	OSTR
+	DB	'OK.',CR,LF,0
+	RET
+;
+; Dateiname abfragen		(Routine 1:1 in CAOS enthalten)
+; PA:	HL	Zeiger auf den eingegebenen Namen
+;	CY=1	mit BRK abgebrochen
+; VR:	AF,HL,DE
+;
+NAME6:	LD	HL,6		; Position der Eingabe bei ERA
+NAMHL:	CALL	PV1
+	DB	OSTR
+	DB	'Name :',0
+if tast
+	LD	A,(MODE)	; aktueller Interrupt-Mode
+	PUSH	AF
+	AND	11110011b	; Bit 2+3 ruecksetzen (Interrupt: CAOS-Mode)
+	LD	(MODE),A
+	CALL	INPUT		; Dateiname abfragen
+	JR	NC,NAME1	; kein BRK
+	POP	AF
+	LD	(MODE),A	; Interrupt-Mode wie vorher
+	SCF			; Fehler-Flag
+	RET			; BRK ab CAOS 4.3
+	;
+NAME1:	POP	AF
+	LD	(MODE),A	; Interrupt-Mode wie vorher
+	ADD	HL,DE		; Beginn Name
+	RET
+else
+	CALL	INPUT		; Dateiname abfragen
+	RET	C		; BRK ab CAOS 4.3
+	ADD	HL,DE		; Beginn Name
+	RET
+endif
+;
+; Dateiname ausgeben
+; PE:	HL	Zeiger auf Zeichenkette
+; PA:	HL	Zeiger auf Zeichen nach Dateinamen (2. Name bei REN)
+;	CY=1	TimeOut
+;
+PUT12:	ld	b,12		; Dateiname 8.3 (max. 12 Zeichen mit Punkt)
+UE1:	ld	a,(hl)
+	inc	hl
+	cp	21h
+	CCF
+	RET	NC		; Leerzeichen, 0 oder Steuerzeichen beendet
+	call	PUTX		; Dateiname ausgeben
+	djnz	UE1
+	RET
+
+;*******************************************************************************
+;	Vinculum Terminalprogramm fuer CAOS 4.7
+;*******************************************************************************
+
+; Funktionen in CAOS:
+;	VINCULUM, uload, usave, tastatur
+;
+; Funktionen im Vinculum-Menue:
+; normal:	MENU, CLS, USB, LOAD, SAVE, DIR
+; versteckt:	reset, cr, mode, hex
+;
+; %mode 0	Normalbetriebsart
+; %mode 1	Im Terminalfenster Steuerzeichen darstellen
+; %mode 2	Im Terminalfenster alles als HEX-Zahlen anzeigen
+;
+;------------------------------------------------------------------------------
+
+; Allgemeine Vereinbarungen:
+
+PROLOG3	EQU	3D3DH	; Prologbyte fuer Vinculum-Menu bis CAOS 4.2
+PROLOG4	EQU	3B3BH	; Prologbyte fuer Vinculum-Menu ab CAOS 4.3
+	; bis Vinculum-Version 3.2:
+;PROLOG4 EQU	3E3EH	; Prologbyte fuer Vinculum-Menu ab CAOS 4.3 macht
+			; Probleme mit ESC-H ab CAOS 4.8 (ASM-Ebene)
+
+; Arbeitszellen ab 300H nur in Benutzung fuer DIR/Sort im Terminalmodus:
+; (300h weil bei CAOS 3.3 von 200-02FFh ein Tastaturpuffer liegt)
+
+data	EQU	0300h	; Datenpuffer fuer DIR und DIRT (30 Zeichen)
+pointer	EQU	031eh	; Zeiger in Verzeichnispuffer
+dcount	EQU	0320h	; Anzahl Dateien
+table	EQU	0322h	; Zeiger auf Beginn der Zeigertabelle (Sort)
+GAP	EQU	0324h	; Variable fuer SORT
+J	EQU	0326h	;	"	"
+TPAEND	EQU	0328H	; Speicherende (4000h oder 8000h)
+page	EQU	032ah	; Zeilenzaehler fuer Page-Modus
+MEMRY	EQU	0330h	; ab hier wird das Verzeichnis abgelegt
+
+;------------------------------------------------------------------------------
+if tast
+; Initialisierungsdaten M052-PIO (USB) - fuer CAOS+Terminal mit Interrupt:
+
+INIT3:	DB	3		; 3 Ports
+
+	DB	PIO52AS		; Steuerport A
+	 DB	2
+	  DB	8FH		; bidirektional
+	  DB	7		; kein INT
+
+	DB	PIO52B		; Datenport B
+	 DB	1
+	  DB	ST0		; Grundstellung (PROG#=1, RESET#=1, DATAREQ#=1)
+
+	DB	PIO52BS		; Steuerport B
+	 DB	5		; Anzahl Steuerbytes
+	  DB	0CFH		; Bitbetrieb
+	  DB	00100011b	; I/O-Pins festlegen
+		; Bit 0 = RXF#		Eingang	Low = Empfangsdaten verfuegbar
+		; Bit 1 = TXE#		Eingang	Low = Bereit zum Daten schreiben
+		; Bit 2 = RD#		Ausgang	Lese-Impuls Low-aktiv
+		; Bit 3 = WR		Ausgang	Schreibimpuls High-aktiv
+		; Bit 4 = DATAREQ#	Ausgang (Takt an Tastatur)
+		; Bit 5 = DATAACK#	Eingang (Daten von Tastatur)
+		; Bit 6 = RESET#	Ausgang	Low loest Ruecksetzen aus
+		; Bit 7 = PROG#		Ausgang Low schaltet in Programmiermode
+	  DB	IVEK		; Int.-Vektor
+	  DB	97h		; EI, OR, Low, Maske folgt
+	  DB	11011111b	; Maske: Bit 5 (Tastatur) loest Interrupt aus
+else
+; Initialisierungsdaten M052-PIO (USB) - fuer Terminal mit Interrupt vorbereitet:
+
+INIT2:	DB	3		; 3 Ports
+
+	DB	PIO52AS		; Steuerport A
+	 DB	2
+	  DB	8FH		; bidirektional
+	  DB	7		; kein INT
+
+	DB	PIO52B		; Datenport B
+	 DB	1
+	  DB	ST0		; Grundstellung (PROG#=1, RESET#=1, DATAREQ#=1)
+
+	DB	PIO52BS		; Steuerport B
+	 DB	5		; Anzahl Steuerbytes
+	  DB	0CFH		; Bitbetrieb
+	  DB	00100011b	; I/O-Pins festlegen
+		; Bit 0 = RXF#		Eingang	Low = Empfangsdaten verfuegber
+		; Bit 1 = TXE#		Eingang	Low = Bereit zum Daten schreiben
+		; Bit 2 = RD#		Ausgang	Lese-Impuls Low-aktiv
+		; Bit 3 = WR		Ausgang	Schreibimpuls High-aktiv
+		; Bit 4 = DATAREQ#	Ausgang (Takt an Tastatur)
+		; Bit 5 = DATAACK#	Eingang (Daten von Tastatur)
+		; Bit 6 = RESET#	Ausgang	Low loest Ruecksetzen aus
+		; Bit 7 = PROG#		Ausgang Low schaltet in Programmiermode
+	  DB	IVEK		; Int.-Vektor
+	  DB	17h		; DI, OR, Low, Maske folgt
+	  DB	11111111b	; Maske: kein Bit loest Interrupt aus
+endif
+if tast
+; M052 mit Tastatur initialisieren mit CAOS < 4.7 (bei CAOS 4.7+ versteckt)
+; Aufruf:	%tastatur ISR-Adresse
+;
+	DW	7F7Fh
+	DB	'tastatur',1
+	CALL	MINIT		; Modul initialisieren
+	RET	C		; kein M052 oder CAOS 2.2
+if isrix
+	LD	E,(IX-32)	; Adresse der ISR
+	LD	D,(IX-31)	; aus Interrupttabelle lesen
+else
+	LD	DE,(01D0H)	; Adresse der ISR
+endif
+	LD	HL,ENDX-ISRX-1	; Laenge der ISR
+	ADD	HL,DE
+	EX	DE,HL		; HL=Beginn, DE=Laenge
+	CALL	PV1
+	DB	OSTR
+	DB	'Tastatur-ISR: ',0
+	CALL	PV1
+	DB	HLDE		; Adressen anzeigen
+	CALL	PV1
+	DB	OSTR
+	DB	8,'H',,8,8,8,8,8,8,'-',cr,lf,0
+	RET
+endif
+;--------------------------------------
+
+; Suche+Einschalten Modul, Initialisieren PIO:
+;	(CAOS-UP 26H fuer Modulsuche nicht verwendbar, da CAOS 3.1
+;	 den Schaltzustand in Register E statt in Register D meldet...)
+;
+; benutzt von %VINCULUM, %tastatur, %uload und %usave
+; ausserdem von %edas/reedas und %basic/rebasic und %bsave
+;
+; PA:	CY=1	Fehler (Modul M052 nicht gefunden)
+;			oder CAOS-Version < 3.1
+;	(VERSION)	erkannte CAOS-Version in BCD
+;
+MINIT:	CALL	KCTEST		; CAOS-Version ermitteln
+	LD	(VERSION),A	; fuer weitere Abfragen hier ablegen
+	CP	31h
+	JR	NC,MIN1		; CAOS-Version ist OK
+	CALL	PV1
+	DB	OSTR
+	DB	'Mindestens CAOS 3.1 erforderlich!'
+	DB	CR,LF,0
+	SCF			; Fehlercode
+	RET
+	;
+MIN1:	LD	H,0B8H		; Modulsteuerbytetabelle
+	LD	B,8		; ab Steckplatz 8 suchen
+	LD	E,0		; noch kein M052 gefunden
+NEXT:	LD	C,80H		; I/O-Adresse Modulsteuerung
+	IN	A,(C)		; Kennbyte lesen
+	CP	MKENN		; Modul M052?
+	JR	Z,FOUND		; gefunden
+MIN2:	INC	B		; naechster Steckplatz
+	JR	NZ,NEXT
+	LD	L,E		; Steckplatz des ersten M052 (falls nicht online)
+	INC	L
+	DEC	L
+	JR	NZ,SWON		; das erste M052 benutzen!
+	CALL	PV1
+	DB	OSTR
+	DB	'kein Modul M052 gefunden!'
+	DB	CR,LF,0
+	SCF			; Fehlercode
+	RET
+;
+; 1. Verwendung des ersten M052, wo die PIO bereits eingeschaltet ist
+; 2. Verwendung des M052, dessen EEPROM bereits auf C000h eingeschaltet ist
+; 3. ansonsten Einschalten des ersten gefundenen M052
+;
+FOUND:	LD	L,B		; Steckplatz
+	ld	a,(hl)		; aktueller Schaltzustand des gefundenen M052
+	bit	2,a		; PIO bereits ein?
+	jr	nz,SWON		; ja, dann dieses Modul verwenden
+	and	11111001b	; Bit 1 und 2 ausblenden
+	CP	0C1h		; M052-EEPROM auf C000h aktiv?
+	JR	Z,SWON		; ja, dann dieses Modul verwenden
+	INC	E
+	DEC	E		; bereits ein M052 gefunden?
+	JR	NZ,MIN2		; ja, dann weiter suchen nach einem aktiven M052
+	LD	E,B		; Steckplatz des ersten M052 merken
+	JR	MIN2		; und weiter suchen ob ein M052-EEPROM aktiv ist
+	;
+SWON:	LD	D,(HL)		; Schaltzustand
+	LD	H,D
+	LD	(SLOT),HL	; und Steckplatz merken
+	SET	2,D		; PIO's einschalten beim verwendeten M052
+	LD	A,2		; Modul "schalten"
+	CALL	PV1
+	DB	MODU
+if tast
+	LD	B,L		; Steckplatz fuer INIT der Tastatur-ISR
+	LD	A,(VERSION)
+	LD	DE,ISR42	; ISR bei CAOS 3.1 bis 4.6 hier eintragen
+	CP	50h		; CAOS 5.0?
+	JR	Z,TINI		; wie CAOS 4.2 behandeln
+	CP	47h
+	JR	C,TINI		; CAOS 3.1 bis 4.6
+	LD	DE,ISR47	; ISR ab CAOS 4.7 hier eintragen
+TINI:
+else
+	LD	HL,INIT2	; PIO-Initialisierung fuer Terminal mit Interrupt
+endif
+	JP	INIT		; initialisieren
+;
+; Test, welche CAOS-Version vorliegt
+; (beim KC85/2 und KC85/3 wird dazu die Menuezeile gesucht und die Version
+;  dort aus der Zeichenkette entnommen. Falls CAOS nicht gefunden wird,
+;  meldet es die Versionsnummer 3.0)
+;
+; PA:	A	CAOS-Versionsnummer BCD
+; VR:	HL, DE, BC, AF
+
+KCTEST:	LD	A,(0E011H)	; Beim KC85/4 steht hier immer BASIC-Menuewort
+	CP	7Fh		; KC 85/4 ?
+	LD	A,(CAOSNR)	; Versionsnummer steht seit CAOS 4.1 immer hier
+	RET	Z		; wir haben CAOS 4.x
+
+; Beim KC85/2 und KC85/3 Suche nach der Menue-Anzeige "CAOS x.y"
+	LD	DE,CAOS		; Vergleichszeichenkette "CAOS"
+	CALL	STRING
+	RET	NC		; CAOS 3.x gefunden
+	LD	DE,OSPI88	; OS PI/88
+	CALL	STRING
+	LD	DE,OSPI90	; OS PI/90
+	CALL	C,STRING	; suchen, falls OS PI/88 nicht gefunden
+	LD	A,32h		; pi/88 und pi/90 als CAOS 3.2 melden
+	RET	NC
+	LD	A,30h		; alles andere als CAOS 3.0 melden
+	ret
+
+OSPI88:	DB	'pi/88'		; Betriebssystem von Frank Pischel
+OSPI90:	DB	'pi/90'
+
+; Suche einer Zeichenkette im ROM zur Ermittlung der CAOS-Version
+; PE:	DE	Vergleichskette
+; PA:	A	Versionsnummer BCD falls CAOS
+;	CY=1	Zeichenkette nicht gefunden
+
+STRING:	LD	HL,0E000h	; HL = Beginn Suchbereich
+	LD	BC,2000h	; BC = Laenge des Suchbereichs
+KCT2:	LD	A,(DE)
+	CPIR			; Suche des ersten Zeichens
+	SCF
+	RET	PO		; String nicht gefunden
+	PUSH	HL
+	PUSH	DE		; Beginn Vergleichskette merken
+	PUSH	BC
+	LD	BC,4		; weitere 4 Zeichen testen
+KCT3:	INC	DE
+	LD	A,(DE)
+	CPI
+	JR	NZ,KCT4		; nicht gefunden
+	JP	PE,KCT3		; wiederholen bis BC=0
+	LD	A,(HL)		; Hauptversion auslesen
+	AND	0Fh
+	RLCA
+	RLCA			; nach Bit 4-7
+	RLCA			; verschieben
+	RLCA
+	LD	C,A
+	INC	HL
+	INC	HL		; Punkt uebergehen
+	LD	A,(HL)		; Unterversion auslesen
+	AND	0Fh
+	OR	C		; Versionsnummer zusammensetzen (CY=0)
+	POP	BC
+	POP	DE
+	POP	HL
+	RET
+	;
+KCT4:	POP	BC
+	POP	DE
+	POP	HL
+	JR	KCT2
+;
+; USB-Version anzeigen
+;
+USBVER:	CALL	PV1
+	DB	OSTR
+	DB	'USB ',0
+	LD	A,(VERS)	; Version der USB-Software
+;
+; Versionsnummer x.y anzeigen:
+;
+VERBCD:	push	af
+	rra
+	rra
+	rra
+	rra
+	call	ahex0		; hoeherwertigen Teil
+	ld	a,'.'		; Trennzeichen
+	call	pv1
+	db	crt
+	pop	af		; niederwertigen Teil
+AHEX0:	PUSH	AF
+	AND	0FH
+	ADD	A,90H
+	DAA
+	ADC	A,40H
+	DAA
+	CALL	PV1
+	DB	CRT
+	POP	AF
+	RET
+;
+; Statuszeile anzeigen:
+; Steckplatz / CAOS-Version / Modus ( Datum )
+;
+STAT:	LD	A,(WINNR)	; aktuelles Fenster merken
+	PUSH	AF
+	CALL	WINR0		; CAOS-Fenster aktivieren
+	LD	HL,1F00H
+	LD	(CURSO),HL	; 1. Position = Steckplatz
+	call	pv1
+	db	ostr
+	DB	2		; CLLN - gesamte Zeile loeschen
+	DB	' M052:',0
+	LD	A,(SLOT)
+	CALL	PV1
+	DB	AHEX		; Steckplatz anzeigen
+
+; Modus anzeigen (Standardmodus ohne Anzeige in Statuszeile)
+; 18.02.2024: ueberschreibt das Wort "CAOS"
+
+	LD	HL,1F0BH	; 2. Position = CAOS-Version oder Modus
+	LD	(CURSO),HL
+	LD	A,(MODE)
+if tast
+	and	3		; nur Bit 1 und 0 auswerten
+	jr	z,dm2		; Mode 0 = Standard
+	dec	a
+	jr	z,dm1		; Mode 1 = Steuerzeichen darstellen
+else
+	dec	a
+	jr	z,dm1		; Mode 1 = Steuerzeichen darstellen
+	dec	a
+	jr	nz,dm2		; Mode 2 = Hex-Anzeige
+endif
+	LD	A,11H		; Modus: rot/blau
+	LD	(COLOR),A
+	CALL	PV1
+	DB	OSTR
+	DB	'HEX',0
+	jr	dm3
+	;
+dm1:	LD	A,11H		; Modus: rot/blau
+	LD	(COLOR),A
+	CALL	PV1
+	DB	OSTR
+	DB	'CTRL',0
+	jr	dm3
+	;
+dm2:	CALL	PV1
+	DB	OSTR
+CAOS:	DB	'CAOS ',0
+	LD	A,(VERSION)	; ermittelte CAOS-Version
+	CALL	VERBCD		; Version anzeigen
+
+dm3:	LD	A,29H		; tuerkis/blau
+	LD	(COLOR),A
+	CALL	ZEIT		; Datum+Uhrzeit aktualisieren
+	POP	AF
+	JR	WIN		; urspruengliches Fenster
+;
+; Fenster aktivieren
+;
+; VR:	AF,BC,DE,HL
+;
+WINR0:	XOR	A		; CAOS-Fenster
+	DB	11h	; LD DE,nn
+WINR1:	LD	A,1		; Terminal-Fenster
+	DB	11h	; LD DE,nn
+WINR2:	LD	A,2		; Eingabefenster
+WIN:	LD	E,WINAK
+	JP	PV3		; (kein DI/EI im Programmcode)
+
+;--------------------------------------
+
+	DW	7F7FH		; Terminal-Menuewort im CAOS
+	DB	'VINCULUM',1
+
+START:	call	minit		; Modul suchen, initialisieren
+	ret	c		; M052 nicht gefunden oder CAOS 2.2
+	LD	A,(VERSION)	; CAOS-Version
+
+; aktuellen Prompt merken, neuen Prompt setzen:
+
+	LD	C,'%'		; Standard-Prompt
+	CP	50h		; CAOS 5.0?
+	JR	Z,INI4		; behandeln wie 4.2
+	CP	32h		; OS/PI?
+	JR	NZ,INI1
+	LD	C,(IX+11)	; aktueller Prompt von OS/PI
+	LD	(IX+11),'>'	; neuer Prompt bei OS/PI
+INI1:	CP	34h		; CAOS 3.4?
+	JR	NZ,INI2
+	LD	HL,0B7D9h	; Prompt bei CAOS 3.4
+	JR	INI3
+	;
+INI2:	CP	43h		; CAOS 4.3 oder hoeher?
+	JR	C,INI4
+	LD	HL,PROMPT	; Prompt ab CAOS 4.3
+INI3:	LD	C,(HL)		; aktueller Prompt
+	LD	(HL),'>'	; neuer Prompt
+INI4:	LD	HL,OLDPR
+	LD	(HL),C		; aktuellen Systemprompt merken
+
+; Prologbyte umstellen entsprechend CAOS-Version:
+
+	CP	50h		; CAOS 5.0 wie 4.2 behandeln
+	jr	z,kc5
+	CP	43h		; mindestens CAOS 4.3 ?
+	jr	nc,kc4
+KC5:	LD	A,low(PROLOG3)	; Prolog bis CAOS 4.2
+	db	21h
+KC4:	LD	A,low(PROLOG4)	; Prolog ab CAOS 4.3
+	LD	(IX+9),A	; neues Prologbyte
+
+	ld	a,(argn)	; Anzahl Argumente
+	and	a		; Argumente vorhanden?
+	jr	z,st2		; nein, Standardmodus 0
+	ld	a,(ARG1)	; 1. Parameter verwenden
+	cp	3
+	jr	c,st2		; nur Parameter 0-2 zugelassen!
+	xor	a		; alles andere ergibt Mode 0
+st2:	ld	(mode),a
+iff tast
+	RES	0,(IX+7)	; Vinculum-Modus (VERIFY)
+endif
+	xor	a
+	ld	(argn),a	; ARGN fuer folgendes MENU zuruecksetzen
+
+; Datum holen und konvertieren:
+
+	CALL	DCONV		; Datum von M064 oder D004/D008 holen
+	JR	NC,UHROK	; kein Fehler
+uhr1:	CALL	PV1
+	DB	OSTR
+	DB	'Datum: '
+	DATSTRING
+	DB	0
+	LD	A,7
+	LD	(CURSO),A	; Eingabe-Cursor auf Anfang des Datums
+	CALL	PV1
+	DB	INLIN		; Eingabe Datum
+	LD	HL,7
+	ADD	HL,DE
+	EX	DE,HL
+	CALL	PV1
+	DB	RHEX		; Tag erfassen
+	ld	a,(de)
+	cp	'.'
+	jr	nz,uhr1		; kein Trennzeichen
+	ld	a,(numvx)
+	ld	c,a		; Tag BCD
+	inc	de
+	CALL	PV1
+	DB	RHEX		; Monat erfassen
+	ld	a,(de)
+	cp	'.'
+	jr	nz,uhr1		; kein Trennzeichen
+	ld	a,(numvx)
+	ld	b,a		; Monat BCD
+	inc	de
+	CALL	PV1
+	DB	RHEX		; Jahr erfassen
+	LD	A,(numvx)	; Jahr (letzte beide Stellen)
+	call	conv		; Datum konvertieren
+	XOR	A
+	LD	(HL),A		; 00:00 als Uhrzeit eintragen
+	inc	HL
+	LD	(HL),A
+
+; CTC2-Interrupt (Blinken) zur Zeitanzeige erweitern
+
+UHROK:	DI
+if isrix
+	LD	L,(ix-4)	; Original-ISR von CTC Kanal 2
+	LD	H,(ix-3)
+	LD	(OLDISR),HL	; hier merken
+	LD	DE,ISR2		; CTC-ISR im RAM 0
+	LD	(ix-4),E	; neue ISR eintragen
+	LD	(ix-3),D
+else
+	LD	HL,(01ECH)	; Original-ISR von CTC Kanal 2
+	LD	(OLDISR),HL	; hier merken
+	LD	DE,ISR2		; CTC-ISR im RAM 0
+	LD	(01ECH),DE	; neue ISR eintragen
+endif
+	LD	HL,ISRC3
+	LD	BC,ENDISC-ISRC3
+	LDIR			; neue ISR in RAM0 kopieren
+	LD	A,0C7H
+	OUT	(CTC2),A	; Zaehlermode mit Interrupt
+;
+; Interrupt sollte etwa alle 2 Sekunden kommen. Der CTC2 zaehlt die Impulse an
+; seinem Zaehleingang. Am Zaehleingang liegt das Signal /BI = Bildimpuls
+; Deshalb:	A=50	ca. 1 Sekunde
+;		A=255	ca. 5 Sekunden
+	LD	A,255		; 5 Sekunden
+	OUT	(CTC2),A	; Zeitkonstante
+	EI
+
+iff tast
+
+; Interrupt fuer Terminal vorbereiten:
+
+	LD	DE,ISR0		; Terminal-ISR im RAM 0
+if isrix
+	LD	(IX-32),E	; Adresse der ISR
+	LD	(IX-31),D	; in Interrupttabelle eintragen
+else
+	LD	(01D0H),DE	; ISR eintragen in Interrupttabelle
+endif
+	LD	HL,ISRC
+	LD	BC,ENDISR-ISRC
+	LDIR			; ISR in RAM0 kopieren
+endif
+
+; Fenster 0 (CAOS):
+ 
+	XOR	A		; Fenster 0
+	LD	H,A
+	LD	L,A		; WINON
+	LD	DE,2028H	; WINLG
+	LD	C,L		; fuer CAOS 4.1
+	CALL	PV1
+	DB	WININ
+	LD	A,39H		; weiss/blau
+	LD	(COLOR),A
+	ld	a,cls
+	call	pv1		; Bildschirm loeschen
+	db	crt
+	LD	A,29H		; tuerkis/blau
+	LD	(COLOR),A
+	CALL	PV1
+	DB	OSTR
+	DB	12H		; scrollen
+	DB	' Terminal   ',0
+	CALL	USBVER		; USB-Version anzeigen
+	CALL	PV1
+	DB	OSTR
+if tast
+VERTXT:	DB	' (VNC2)',0
+else
+VERTXT:	DB	' (VNC1)',0
+endif
+	LD	A,1EH
+	LD	(CURSO),A
+	CALL	PV1
+	DB	OSTR
+	DB	'` ML-Soft',0
+
+	CALL	STAT		; Statuszeile (unten) anzeigen
+
+; Fenster 1 (Terminal):
+
+	LD	A,1		; Fenster 1
+	LD	H,A
+	LD	L,A		; WINON
+	LD	DE,1326H	; WINLG
+	LD	C,L		; fuer CAOS 4.1
+	CALL	PV1
+	DB	WININ
+	LD	A,3CH		; weiss/gruen
+	LD	(COLOR),A
+	CALL	PV1
+	DB	OSTR
+	DB	CLS
+	DB	12H		; scrollen
+	DB	0
+
+; vorhandene Daten leeren (sync mit Anzeige im Terminalfenster):
+
+	CALL	LEER		; vorhandene Daten anzeigen und synchronisieren
+	IN	A,(PIO52A)	; Dummy-Eingabe
+ 
+; Fenster 2 (Menu):
+ 
+	LD	A,2		; Fenster 2
+	LD	HL,1501H	; WINON
+	LD	DE,0A26H	; WINLG
+	LD	C,L		; fuer CAOS 4.1
+	CALL	PV1
+	DB	WININ
+	LD	HL,STBT
+	RES	1,(HL)		; Farbe ein
+	INC	HL
+	LD	(HL),38H	; weiss/schwarz
+	INTON			; Terminal-Mode fuer Interrupt
+	LD	A,ECS		; Extend. CMD
+	CALL	PUTi
+	LD	A,CR
+	CALL	PUTi
+	JR	MEN1
+
+; Terminal-Schleife:
+
+	DW	PROLOG3
+	DB	'MENU',1
+	JR	MEN
+;
+	DW	PROLOG4
+	DB	'MENU',1
+MEN:	POP	HL		; Stack clear
+MEN1:	CALL	WINR2		; Fenster 2 aktivieren
+	CALL	PV1
+	DB	OSTR
+	DB	CLS
+	DB	'* Vinculum *',0
+	LD	A,(0E011H)	; bei KC85/4 steht hier Menuewort "BASIC"
+	CP	7Fh
+	CALL	NC,LFCR		; CR+LF fuer CAOS 3.1 erforderlich!
+	CALL	PV1
+	DB	MENU		; Menue anzeigen
+
+; -----------------------------------------------------------------------------
+
+; eigene MENU-Routine, die bei Bedarf (abhaengig von CAOS-Version) die
+; zusatzlichen USB-Menueworte (in Kleinbuchstaben) mit anzeigt
+; steht vor der CAOS-Menueroutine und wird deshalb immer benutzt wenn der
+; EEPROM des M052 aktiviert ist.
+
+	DW	7F7FH
+CMENU:	DB	'MENU',1
+	call	KCTEST		; CAOS-Version ermitteln
+	cp	31h
+	jr	c,UMEN1		; KC85/2
+	CP	50h
+	JR	Z,UMEN3		; CAOS 5.0 wie CAOS 4.2 behandeln
+	cp	47h
+	jr	c,UMEN3		; CAOS 3.1 bis 4.6
+; CAOS 2.2 oder ab 4.7: Suche das CAOS-Menuewort und springe dort hin
+UMEN1:	LD	A,7FH		; A = CAOS-Prologbyte
+	LD	DE,CMENU	; DE = Vergleichszeichenkette "MENU"
+	LD	HL,0E000h	; HL = Beginn Suchbereich
+	LD	BC,1E00h	; BC = Laenge des Suchbereichs
+	CALL	PV1		; Menuewort suchen von E000h bis FE00H
+	DB	ZSUCH
+	JR	C,UMEN2		; Menuewort gefunden
+	CALL	PV1
+	DB	ERRM		; Menuewort nicht gefunden
+	CALL	PV1		; (sollte eigentlich nicht vorkommen)
+	DB	CRLF
+	RET
+	;
+UMEN2:	INC	HL		; Epilog uebergehen
+	JP	(HL)		; in die Menuekommando von CAOS springen
+
+; Auflisten aller Menueworte bei CAOS 3.1 bis 4.6:
+UMEN3:	PUSH	AF		; CAOS-Version merken
+	XOR	A		; Fenster 0
+	LD	H,A
+	LD	L,A
+	LD	DE,2028H
+	LD	C,L		; fuer CAOS 4.1
+	CALL	PV1		; volles Fenster!
+	DB	WININ
+	LD	A,39H		; weiss/blau
+	LD	(COLOR),A
+	CALL	PV1
+	DB	OSTR
+	DB	CLS,LF
+	DB	'* KC-CAOS ',0
+	POP	AF
+	LD	E,A
+	CALL	VERBCD		; ermittelte CAOS-Version anzeigen
+	CALL	PV1
+	DB	OSTR
+	DB	' mit ',0
+	CALL	USBVER		; USB-Version anzeigen
+	CALL	PV1
+	DB	OSTR
+	DB	' *',0
+	LD	HL,0C000H	; Menuewortsuche ab C000H
+	LD	C,L
+	LD	B,L		; BC=0 (Suchlaenge)
+	LD	A,E
+	CP	43h
+	LD	D,2		; Bis CAOS 4.2 Epilogbytes 0-1 zulaessig
+	JR	C,UM0
+	LD	D,20h		; ab CAOS 4.3 Epilogbytes 0-1Fh
+UM0:	LD	E,'%'		; Standard-Prompt
+	CP	50h		; CAOS 5.0?
+	JR	Z,UMEN4
+	CP	32h		; OS/PI?
+	jr	nz,UM1
+	LD	E,(IX+11)	; Systemprompt bei OS/PI
+UM1:	cp	34h		; CAOS 3.4?
+	JR	NZ,UM2
+	LD	A,(0B7D9h)	; Systemprompt bei CAOS 3.4
+	JR	UM3
+	;
+UM2:	CP	43h		; CAOS 4.3+?
+	JR	C,UMEN4
+	LD	A,(PROMPT)	; Systemprompt ab CAOS 4.3
+UM3:	LD	E,A		; Prompt-Zeichen
+UMEN4:	CALL	LFCR
+UMEN5:	LD	A,2		; CLLN
+	CALL	PV1		; Zeile loeschen
+	DB	CRT
+	LD	A,E		; Prompt von CAOS
+	CALL	PV1
+	DB	CRT
+	CALL	PV1
+	DB	BRKT
+	JR	C,UMEN8		; Break
+	LD	A,(IX+9)	; Prologbyte
+UMEN6:	CPIR
+	JP	PO,UMEN8	; ausgesucht
+	CPI			; 2mal nacheinander?
+	JP	PO,UMEN8	; ausgesucht
+	JR	NZ,UMEN6	; nicht 2mal
+UMEN7:	LD	A,(HL)
+	CP	D		; gueltiges Epilogbyte?
+	JR	C,UMEN4
+	CP	'0'		; >= '0' und
+	JR	C,UMEN5		; kleiner als '0'
+	CP	'z'+1		; <= 'z'?
+	JR	NC,UMEN5	; groesser als 'z'
+	CALL	PV1
+	DB	OCHR
+	INC	HL
+	DEC	BC
+	LD	A,C
+	OR	B
+	JR	NZ,UMEN7
+UMEN8:	CALL	PV1
+	DB	OSTR
+	DB	19h,0		; Cursor ganz nach links
+	LD	SP,(SYSP)	; System-SP neu setzen
+	CALL	PV1		; Prompt anzeigen und
+	DB	LOOP		; zu CAOS-Eingabeschleife uebergehen
+
+; Terminalfenster loeschen:
+ 
+	DW	PROLOG3
+	DB	'CLS',1
+	JR	CLS0
+;
+	DW	PROLOG4
+	DB	'CLS',1
+CLS0:	CALL	WINR1		; Fenster 1
+	LD	A,CLS		; BS loeschen
+	CALL	PV1
+	DB	CRT
+CLS1:	JP	WINR2		; Fenster 2
+ 
+; Neue Zeile im Terminalfenster:
+ 
+	DW	PROLOG3
+	DB	'cr',1		; verstecktes Menuewort
+	JR	CR0
+;
+	DW	PROLOG4
+	DB	'cr',1
+CR0:	CALL	WINR1		; Fenster 1
+	CALL	LFCR		; Neue Zeile
+	JR	CLS1
+ 
+; Kommando zu VDIP1 senden:
+ 
+	DW	PROLOG3
+	DB	'USB',1
+	CALL	PV1		; bis CAOS 4.2 Kommando per Eingabe abfragen
+	DB	OSTR
+	DB	'Kommando:',0
+	CALL	PV1
+	DB	INLIN
+	LD	HL,9
+	ADD	HL,DE
+	EX	DE,HL
+	JR	USB1
+;
+	DW	PROLOG4
+	DB	'USB',1FH	; ab CAOS 4.3 Textargument aus Kommandozeile
+USB1:	LD	A,(DE)
+	OR	A
+	JR	Z,USB2		; Ende-0
+	INC	DE
+	CALL	PUTi		; >> USB
+	JR	USB1
+	;
+USB2:	LD	A,CR		; abschliessendes CR
+	CALL	PUTi
+	RET
+ 
+; EXIT zu CAOS:
+ 
+	DW	PROLOG3
+	DB	'QUIT',1
+	JR	EXIT
+;
+	DW	PROLOG4
+	DB	'QUIT',1
+EXIT:	DI
+	LD	HL,(OLDISR)	; urspruengliche CTC2-ISR
+if isrix
+	LD	(ix-4),L	; wieder in ISR-Tabelle eintragen
+	LD	(ix-3),H
+else
+	LD	(01ECH),HL	; wieder in ISR-Tabelle eintragen
+endif
+	LD	A,47H
+	OUT	(CTC2),A	; Zaehlermode ohne Interrupt
+	LD	A,12		; Originalwert Blinkfrequenz
+	OUT	(CTC2),A	; Zeitkonstante
+	EI
+	CALL	WINR0		; Fenster 0
+	LD	A,39H		; weiss/blau
+	LD	(COLOR),A
+	LD	HL,1400h
+	ld	(CURSO),HL	; Position zwischen Fenster 1+2
+
+	LD	(IX+9),7FH	; CAOS-Prolog
+	LD	BC,(OLDPR)	; gemerkter Systemprompt
+	LD	A,(VERSION)	; CAOS-Version
+	CP	32h
+	JR	NZ,exit0
+	LD	(IX+11),C	; SystemPrompt bei OS/PI'88 und '90
+	JR	EXIT2
+	;
+exit0:	CP	34h
+	LD	HL,0B7D9h	; Prompt bei CAOS 3.4
+	JR	Z,exit1
+	CP	43H
+	JR	C,EXIT2
+	LD	HL,PROMPT	; Prompt ab CAOS 4.3
+exit1:	LD	(HL),C		; SystemPrompt regenerieren
+EXIT2:	INTX			; Interrupt-Mode fuer CAOS
+	LD	HL,(SLOT)
+	LD	D,H		; urspruenglicher Zustand
+	LD	A,2		; Modul "schalten"
+	CALL	PV1
+	DB	MODU		; M052 wieder ausschalten (falls es aus war...)
+	RET
+
+; Datei laden (Terminal):
+
+	DW	PROLOG3
+	DB	'LOAD',1
+	JR	LOA4
+;
+	DW	PROLOG4
+	DB	'LOAD',1
+LOA4:	CALL	ULOAD		; Datei laden
+	JR	C,LOA8		; Fehler
+	LD	A,(CASS+10H)
+	CP	3
+	JR	C,LOA8		; kein Autostart
+	LD	A,(ARGN)
+	CP	2
+	JR	NC,LOA8		; Start unterdruecken!
+	CALL	SAV8		; ECS, CR+LF (ohne Anzeige)
+	LD	HL,(ARG3)
+	PUSH	HL		; Startadrasse aufrufen
+	jp	EXIT		; vorher Modul aus!
+	;			; -> Interrupt: CAOS-Mode
+	;
+LOA8:	jp	disp11		; EI, ECS, CR+LF (mit Anzeige)
+				; -> Interrupt Terminal-Mode
+
+; Datei laden (CAOS, verstecktes Menuewort)
+
+	DW	7F7Fh
+	DB	'uload',1	; fuer alle CAOS-Versionen geeignet
+	SET	0,(IX+7)	; CAOS-Modus (LOAD)
+	call	minit		; Modul suchen, initialisieren
+	ret	c		; M052 nicht gefunden oder CAOS 2.2
+	call	sync		; mit Vinculum synchronisieren (ohne Anzeige)
+;	jr	c,EXIT2		; TimeOut
+	CALL	NC,ULOAD	; Datei laden (wenn kein TimeOut)
+	CALL	LFCR		; neue Zeile
+	JR	C,EXIT2		; Fehler beim Laden! (oder TimeOut)
+	LD	A,(CASS+10H)
+	CP	3
+	JR	C,EXIT2		; kein Autostart, fertig
+	LD	A,(ARGN)
+	CP	2
+	JR	NC,EXIT2	; Start unterdruecken!
+	LD	HL,(ARG3)
+	PUSH	HL		; Startadrasse aufrufen
+	jr	EXIT2		; vorher Modul aus!
+;
+; Datei laden (im Terminal oder von CAOS aus)
+;
+; PA:	CY=1	Fehler oder BRK
+;
+ULOAD:	CALL	GETKCC		; Dateiname eingeben
+	JR	NC,BLOAD	; kann kein BRK sein
+	LD	A,(VERSION)
+	CP	43h		; CY=1 ist ab CAOS 4.3 BRK!
+	ccf
+	ret	c
+BLOAD:	INTOF			; File-Mode fuer Interrupt
+	LD	A,SCS		; Short CMD
+	CALL	PUTX
+	CALL	EXEC
+	RET	C		; Error
+	LD	A,IPH		; HEX- bzw. BIN-Modus
+	CALL	PUTX
+	CALL	EXEC
+	RET	C		; Error
+	CALL	UOPENR		; Datei zum Lesen oeffnen
+	RET	C		; Error
+;	CALL	EXEC
+;	RET	C		; Error
+
+; Vorblock lesen...
+
+	LD	HL,CASS		; Ziel=Kassettenpuffer
+	LD	BC,128
+	CALL	READX		; Vorblock lesen
+	LD	(HL),A		; letztes Byte ablegen
+	JR	C,LOADE		; Error
+	LD	A,(CASS+10H)	; Anzahl ARG
+	SUB	2
+	CP	9
+	JR	C,LOA1
+	CALL	PV1
+	DB	OSTR
+	DB	' Keine MC-Datei!',0
+	JP	UCLOSE		; geoeffnete Datei schliessen
+	;
+; Reaktion bei Lesefehler
+LOADE:	CALL	UCLOSE		; geoeffnete Datei schliessen
+	SCF			; Fehlerflag wieder setzen
+	JP	ERRX		; Fehlercode anzeigen
+	;
+LOA1:	LD	HL,(CASS+11H)	; AADR
+	LD	DE,(CASS+13H)	; EADR
+	LD	BC,(CASS+15H)	; SADR
+	PUSH	BC
+	LD	A,(ARGN)
+	AND	A		; Ladeoffset?
+	JR	Z,LOA2		; nein
+	LD	BC,(ARG1)	; Offset
+	ADD	HL,BC
+	EX	DE,HL		; AADR, EADR
+	ADD	HL,BC		; umrechnen
+	EX	DE,HL
+	EX	(SP),HL
+	ADD	HL,BC		; SADR umrechn.
+	EX	(SP),HL
+LOA2:	ld	a,19h		; Zeilenanfang
+	call	pv1
+	db	OCHR
+	CALL	PV1
+	DB	HLDE		; AADR EADR anzeigen
+	LD	A,(CASS+10H)
+	CP	3		; Autostart?
+	JR	C,LOA3		; nein
+	EX	(SP),HL
+	CALL	PV1
+	DB	HLHX		; SADR anzeigen
+	EX	(SP),HL
+LOA3:	POP	BC
+	LD	(ARG1),HL	; AADR merken
+	LD	(ARG2),DE	; EADR ...
+	LD	(ARG3),BC	; SADR ...
+	CALL	LFCR		; neue Zeile fuer Blocknummern
+
+; Daten laden...
+
+LOA5:	LD	DE,(ARG1)	; akt. Adresse
+	LD	HL,(ARG2)	; Endadresse
+	AND	A
+	SBC	HL,DE
+	JP	Z,UCLOSE	; fertig und OK!
+	LD	BC,128
+	SBC	HL,BC
+	JR	NC,LOA6		; mehr als 128 Byte
+	ADD	HL,BC		; Rest
+	LD	B,H
+	LD	C,L		; restliche Anzahl
+LOA6:	EX	DE,HL		; HL=Ladeadresse
+	CALL	READX		; Datenbytes lesen und in Speicher schreiben
+	LD	(HL),A		; letztes Byte ablegen
+	INC	HL
+	JR	C,LOADE		; Error
+	INC	(IX+2)		; naechste Blocknummer
+	CALL	BLNR		; Blocknummer anzeigen
+	LD	(ARG1),HL
+	JR	LOA5
+
+; Datei speichern (Terminal):
+ 
+	DW	PROLOG3
+	DB	'SAVE',1
+	JR	SAVE4
+;
+	DW	PROLOG4
+	DB	'SAVE',5	; 2 Parameter erforderlich
+SAVE4:	CALL	USAVE		; Datei speichern
+	INTON			; Terminal-Mode fuer Interrupt
+	RET
+
+; Datei speichern (CAOS, verstecktes Menuewort)
+
+	DW	7F7Fh
+	DB	'usave',1	; fuer alle CAOS-Versionen geeignet
+	SET	0,(IX+7)	; CAOS-Modus (LOAD)
+	call	minit		; Modul suchen, initialisieren
+	ret	c		; M052 nicht gefunden oder CAOS 2.2
+	call	sync		; mit Vinculum synchronisieren (ohne Anzeige)
+;	jr	c,EXIT2		; TimeOut
+	CALL	NC,USAVE	; Datei speichern (wenn kein TimeOut)
+	JP	EXIT2		; Modul aus und Interrupt: CAOS-Mode
+;
+; Datei speichern (im Terminal oder von CAOS aus)
+; PE:	ARGN, ARG1, ARG2, ARG3
+; PA:	CY=1	Fehler
+;
+USAVE:	LD	A,(ARGN)	; Anzahl der Argumente
+	CP	2		; mindestens 2 (AARD + EADR)
+	JR	NC,SAV0
+	CALL	PV1
+	DB	OSTR
+	DB	'Zu wenig Argumente!',cr,lf,0
+	RET
+	;
+SAV0:	CALL	GETKCC		; Dateiname eingeben
+	JR	NC,BSAVE
+	LD	A,(VERSION)
+	CP	43h		; CY=1 ist ab CAOS 4.3 BRK!
+	ccf
+	ret	c		; BRK
+BSAVE:	INTOF			; File-Mode fuer Interrupt
+	LD	A,SCS		; Short CMD
+	CALL	PUTX
+	CALL	EXEC
+	JR	C,SAV8		; Error
+	LD	A,IPH		; HEX- bzw. BIN-Modus
+	CALL	PUTX
+	CALL	EXEC
+	JR	C,SAV8		; Error
+
+; Vorblock erzeugen...
+ 
+	LD	DE,CASS+128
+	XOR	A
+SAV1:	DEC	E		; Kassettenpuffer
+	LD	(DE),A		; loeschen
+	JR	NZ,SAV1
+	LD	HL,NAME		; Dateiname
+	LD	BC,8+3		; Name + Typ
+	LDIR			; in Vorblock kopieren
+	LD	HL,ARGN		; Adresse in Vorblock kopieren
+	LD	A,(HL)		; Anzahl der Argumente
+	ADD	A		; *2
+	INC	A		; +1
+	LD	C,A
+	LD	E,10H
+	LDIR			; Argumente
+
+	CALL	UTEST		; Test ob Datei bereits vorhanden ist
+	JR	C,SAV8		; Abbruch oder Fehler
+	CALL	UOPENW		; Datei zum Schreiben oeffnen
+	JR	C,SAV8		; Error
+	LD	HL,CASS
+	CALL	WR128		; Vorblock schreiben
+	JR	C,SAV7		; Error
+	CALL	BLNR		; Blocknummer anzeigen
+
+; Daten schreiben...
+ 
+	LD	HL,(ARG1)	; Anfangsadresse
+SAV6:	CALL	WR128		; Datenblock schreiben
+	JR	C,SAV7		; Error
+	CALL	BLNR		; Blocknummer anzeigen
+	PUSH	HL
+	LD	DE,(ARG2)	; Endadresse
+	AND	A
+	SBC	HL,DE		; fertig?
+	POP	HL
+	JR	C,SAV6		; weiter
+ 
+SAV7:	CALL	UCLOSE
+SAV8:	LD	A,ECS		; Extend. CMD
+	CALL	PUTX
+	CALL	EXEC		; Kommando ausfuehren
+;	LD	A,CR
+;	CALL	PUTX
+	JP	LFCR
+
+; Verzeichnis einlesen, sortieren und anzeigen:
+
+	DW	PROLOG3
+	DB	'DIR',1		; Verzeichnisanzeige
+	CALL	PV1
+	DB	OSTR
+	DB	'Maske:',0	; Maske per Eingabe abfragen
+	CALL	PV1
+	DB	INLIN
+	LD	HL,6
+	ADD	HL,DE
+	JR	DIR1
+;
+	DW	PROLOG4
+	DB	'DIR',1FH	; Verzeichnisanzeige
+	EX	DE,HL		; Maske in HL uebergeben
+DIR1:	CALL	getmsk		; Maske aufbereiten und nach NAME kopieren
+
+	ld	hl,4000h	; Test, ob RAM4 vorhanden ist
+	ld	(hl),a
+	inc	(hl)
+	inc	a
+	cp	(hl)
+	jr	nz,ram4
+	add	hl,hl		; HL=8000h
+RAM4:	ld	(TPAEND),hl
+	INTOF			; File-Mode fuer Interrupt
+	LD	A,SCS		; Short CMD
+	CALL	PUTi
+	LD	A,CR		; Kommando
+	CALL	PUTi		; Abschluss
+	CALL	PRMT		; Prompt bzw. Fehlercode abholen
+	RET	C		; Error
+	LD	A,IPH		; HEX- bzw. BIN-Modus
+	CALL	PUTi
+	LD	A,CR		; Kommando
+	CALL	PUTi		; Abschluss
+	CALL	PRMT		; Prompt bzw. Fehlercode abholen
+	RET	C		; Error
+
+; DIR-Kommando ausfuehren:
+
+	ld	a,dir		; DIR
+	call	PUTi
+	ld	a,cr		; ohne Parameter
+	call	PUTi
+
+	call	RAWI0		; erstes Zeichen holen
+	jp	c,RDERR		; (TimOut)Fehler
+	cp	cr
+	jr	z,rdcr		; DIR-Ausgabe beginnt immer mit einem CR
+
+; ansonsten Fehler!
+RDERR:	push	af
+	CALL	WINR1		; Terminal-Fenster 1 anwaehlen
+	pop	af
+RDE1:	CP	CR
+	JR	NZ,RDE2
+	LD	A,'-'
+RDE2:	CALL	CRTi		; Fehlercode im Terminalfenster anzeigen
+	CALL	GET		; weitere Daten anliegend?
+	JR	NC,RDE1		; ja, anzeigen
+	CALL	PV1
+	DB	ERRM
+	JP	DISP10		; Fenster 2, ECS und Ende.
+
+rdcr:	ld	hl,memry	; Directory hier ablegen
+	ld	(pointer),hl	; Zeiger setzen
+	ld	hl,0
+	ld	(dcount),hl	; Zaehler zuruecksetzen
+rd0:	ld	hl,data		; Datenpuffer fuer eine Zeile
+	ld	e,30		; max. Puffergroesse
+rd1:	push	bc
+	call	RAWI0		; Zeichen holen
+	pop	bc
+	jp	c,RDERR		; (TimeOut)Fehler
+	ld	(hl),a		; ablegen
+	inc	hl
+	cp	cr
+	jr	z,rd2		; CR erkannt
+	dec	e
+	jr	nz,rd1		; weiter bis Puffer voll ist
+rd2:	ld	hl,data
+	ld	a,(hl)
+	cp	'>'
+	jp	z,disp1		; Prompt erkannt -> Anzeige Verzeichnis
+	cp	cr
+	jr	z,rd0		; Leerzeile -> ignorieren
+
+; Eintrag in Puffer kopieren:
+
+	ld	hl,(pointer)	; Verzeichnispuffer
+	ld	de,data		; gelesene Zeile
+	ld	a,(de)
+	ld	b,12		; max. Laenge 8.3
+mov1:	ld	a,(de)
+	ld	c,a		; Zeichen merken
+	cp	cr		; fertig?
+	jr	nz,mov5
+	ld	a,b
+	cp	4		; Position von Trennzeichen?
+	ld	a,' '
+	jr	nz,mov4		; nein, Rest sind ein Leerzeichen
+	ld	a,'.'
+	jr	mov4		; Dateien ohne Typ mit Punkt ergaenzen!
+	;
+mov5:	inc	de
+	ld	a,c
+	cp	' '		; Trennzeichen Verzeichnisname/DIR ?
+	jr	z,mov2
+	cp	'.'		; Trennzeichen Dateiname/Typ?
+	jr	nz,mov4
+	ld	a,(data)
+	cp	'.'		; Unterverzeichnis?
+	jr	z,mov3
+mov2:	ld	a,b		; noch Zeichen
+	cp	5		; kleiner als 5?
+	jr	c,mov3		; ja, wir sind richtig
+	ld	a,' '
+	ld	(hl),a		; Leerzeichen einfuegen
+	inc	hl		; ansonsten ein Zeichen weiter gehen
+	dec	b		; und mitzaehlen
+	jr	mov2
+mov3:	ld	a,c
+mov4:	ld	(hl),a		; Zeichen ablegen
+	inc	hl
+	djnz	mov1		; wiederholen fuer alle 12 Zeichen
+
+; Test, ob Eintrag der Maske entspricht:
+
+	ld	hl,(pointer)
+	ld	a,(hl)		; erstes Zeichen
+	cp	'.'		; Unterverzeichnis?
+	jr	z,copy		; ja, nicht rausfiltern!
+	ld	de,NAME
+	ld	a,(de)
+	cp	' '		; Maske angegeben?
+	jr	z,copy		; nein, alles anzeigen!
+	ld	b,8		; Dateiname pruefen
+cop1:	ld	a,(de)
+	cp	'?'		; Wildcard?
+	jr	z,cop2
+	cp	(hl)
+	jr	nz,rd0		; entspricht nicht der Maske!
+cop2:	inc	hl
+	inc	de
+	djnz	cop1
+	inc	hl		; Trennzeichen uebergehen
+	ld	b,3		; Dateityp pruefen
+cop3:	ld	a,(de)
+	cp	'?'		; Wildcard?
+	jr	z,cop4
+	cp	(hl)
+	jp	nz,rd0		; entspricht nicht der Maske!
+cop4:	inc	hl
+	inc	de
+	djnz	cop3
+
+; Eintrag uebernehmen:
+
+copy:	ld	hl,(pointer)
+	ld	bc,12
+	add	hl,bc		; Zeiger weitersetzen
+	ld	(pointer),hl	; neuer Zeiger jetzt gueltig
+	ex	de,hl
+	ld	hl,(tpaend)
+	sbc	hl,de
+	jp	c,MEMERR	; Speicherueberlauf!
+	ld	hl,(dcount)
+	inc	hl		; Eintraege zaehlen
+	ld	(dcount),hl
+	jp	rd0		; naechsten einlesen
+
+; Anzeige sortiertes Directory (in 3 Spalten):
+
+disp1:
+if tast
+	LD	A,(MODE)
+	AND	11110011b	; Bit 2+3 ruecksetzen
+	or	8		; Interruptmode = Terminal
+	LD	(MODE),A
+endif
+	call	pv1		; Leerzeichen vor Anzahl der Dateien
+	db	space
+	ld	hl,(dcount)
+	call	HLDEZI		; Anzahl dezimal anzeigen
+	call	pv1
+	DB	ostr
+	db	' Dateien/Verzeichnisse.',0
+	CALL	WINR1		; Terminal-Fenster 1 anwaehlen
+	ld	a,(mode)
+	and	3		; nur Bits 1 und 0 auswerten
+	LD	A,CLS		; Fenster 1 loeschen
+	CALL	Z,PV1		; Im Debugmode den BS nicht loeschen
+	DB	CRT	; ergibt NOP falls PV1 nicht aufgerufen wird
+	ld	hl,(pointer)
+	ld	(table),hl	; Beginn Zeigertabelle nach Eintraegen
+	ld	hl,(dcount)
+	ld	a,h
+	or	l
+	jp	z,disp9		; keine Eintraege vorhanden!
+	call	sort		; Verzeichnis sortieren
+	jr	c,memerr	; Speicher reicht nicht (fuer Zeigertabelle)
+	ld	hl,(table)	; Zeigertabelle
+	ld	de,(dcount)	; Anzahl Eintraege
+disp2:	ld	a,16		; 16 Zeilen pro Seite
+disp3:	ld	(page),a
+disp4:	ld	c,3		; 3 Spalten pro Zeile
+disp5:	ld	a,d
+	or	e
+	jr	z,disp9		; alle Dateien sind angezeigt!
+	push	hl
+	ld	a,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,a		; Zeiger lesen
+	ld	b,12
+disp6:	ld	a,(hl)
+	inc	hl
+	call	crtx		; Dateiname anzeigen
+	djnz	disp6
+	pop	hl
+	inc	hl
+	inc	hl		; naechster Zeiger
+	dec	de		; Anzahl -1
+	dec	c
+	jr	z,disp7		; neue Zeile
+	ld	a,' '
+	call	crtx		; Leerzeichen zwischen den Spalten
+	jr	disp5		; weiter in dieser Zeile
+	;
+disp7:	ld	a,(page)
+	dec	a		; letzte Zeile erreicht?
+	jr	nz,disp3	; nein, weiter anzeigen
+	;
+disp8:	call	pv1
+	db	kbd		; Tastatureingabe abwarten
+	cp	3
+	jr	z,disp10	; BRK -> Abbruch
+	cp	' '
+	jr	z,disp4		; SPC -> eine weitere Zeile
+	cp	cr
+	jr	nz,disp8
+	jr	disp2		; CR = neue Seite
+
+MEMERR:	CALL	PV1
+	DB	OSTR
+	DB	'Zu wenig Speicher!',0
+disp9:	LD	A,(CURSO)
+	AND	A		; bereits in linker Spalte?
+	CALL	NZ,LFCR		; sonst neue Zeile in Fenster 1
+disp10:	CALL	WINR2		; Fenster 2
+disp11:	INTON			; Terminal-Mode fuer Interrupt
+	LD	A,ECS		; Extend. CMD
+	CALL	PUTi
+	LD	A,CR
+	CALL	PUTi
+	JP	LFCR
+
+; eingelesenes Verzeichnis alphabetisch sortieren,
+; Verzeichnisse dabei zuerst anordnen
+; PA:	CY=1	Speicherueberlauf
+
+; 1. Zeigertabelle erzeugen:
+
+sort:	ld	hl,(table)	; Beginn der Zeigertabelle
+	ld	de,(dcount)
+	add	hl,de
+	add	hl,de		; + 2 Byte je Eintrag
+	ex	de,hl
+	ld	hl,(tpaend)	; TPA-Ende
+	sbc	hl,de
+	ret	c		; das reicht nicht!
+
+	ld	hl,(dcount)	; Anzahl Elemente
+	push	hl
+	ld	de,memry	; Tabelle der Namen
+	ld	hl,(table)	; Zeigertabelle
+	ld	bc,12		; Laenge eines Eintrages
+BLORD:	ld	(hl),e
+	inc	hl
+	ld	(hl),d
+	inc	hl
+	ex	de,hl
+	add	hl,bc		; naechstes Element
+	ex	de,hl
+	ex	(sp),hl
+	dec	hl		; noch ein Element?
+	ld	a,h
+	or	l
+	ex	(sp),hl
+	jr	nz,BLORD
+	pop	hl
+;
+; 2. Sortieren ueber Zeiger-Methode
+; (Shell-SORT von "Software Tools", Kernigan/Plaugher, (c) 1976)
+;
+	ld	hl,(dcount)	; Anzahl Elemente
+	ld	(GAP),hl	; GAP fuer ersten Vergleich initialisieren
+SORT0:	ld	hl,(GAP)
+	srl	h
+	rr	l		; GAP:=GAP/2
+	ld	a,l
+	or	h
+	ret	z		; fertig, wenn GAP/2=0
+	bit	0,l		; GAP ungeradzahlig?
+	jr	nz,SORT1
+	dec	hl		; GAP ungerade machen
+SORT1:	ld	(GAP),hl
+SORT2:	ld	(J),hl		; J:=GAP
+;
+; For (J=GAP+1; J<=N; J=J+1)
+;
+RIGHT:	ld	hl,(J)
+	inc	hl		; J:=J+1
+	ld	(J),hl
+	ex	de,hl		; DE=(J)
+	ld	hl,(dcount)
+	or	a
+	sbc	hl,de		; Anzahl-J
+	jr	c,SORT0		; neu starten, wenn I > N
+;
+; For (I=J-GAP; J>0; I=J-GAP)
+;
+LEFT:	ld	hl,(GAP)
+	ex	de,hl
+	sbc	hl,de		; I:=J-GAP
+	jr	c,RIGHT		; wenn J < 0
+	jr	z,RIGHT		; wenn J = 0
+;
+; Set JG=I+GAP
+;
+	ex	de,hl
+	add	hl,de		; JG:=I+GAP
+;
+; If (I) <= (JG) then Break else Exchange
+;
+	push	hl
+	push	de
+	call	COMPAR		; Vergleich
+	pop	de
+	pop	hl
+	jr	z,RIGHT		; Dateiname gleich (sollte nicht vorkommen!)
+	jr	nc,RIGHT	; richtig sortiert
+	push	de
+	call	SWAP		; Austausch
+	pop	de
+	jr	LEFT		; zurueck furr weitere Tests
+;
+; Zeiger zweier Elemente austauschen
+; PE:	HL,DE	Nummer der Elemente
+; VR:	AF,BC,DE,HL
+;
+SWAP:	ld	bc,(table)	; Adresstabelle
+	dec	bc
+	dec	bc
+	add	hl,hl		; *2
+	add	hl,bc		; 1. Element
+	ex	de,hl
+	add	hl,hl		; *2
+	add	hl,bc		; 2. Element
+	call	SWAP1		; erst aufrufen, dann reinlaufen
+SWAP1:	ld	c,(hl)
+	ld	a,(de)
+	ex	de,hl
+	ld	(hl),c
+	ld	(de),a
+	inc	hl
+	inc	de
+	RET
+;
+; Zwei Eintraege ueber deren Zeiger vergleichen
+; PE:	HL,DE	Nummer der Elemente
+; PA:	CY=1	(HL) > (DE)
+;	Z=1	Namen gleich, dann
+;		CY'=1	(HL) > (DE) bei Vergleich der EXT-Nummer
+; VR:	AF,BC,DE,HL
+;
+COMPAR:	ld	bc,(table)	; Adresstabelle
+	dec	bc
+	dec	bc
+	add	hl,hl		; *2
+	add	hl,bc		; 1. Element
+	ex	de,hl
+	add	hl,hl		; *2
+	add	hl,bc		; 2. Element
+	ex	de,hl
+	ld	c,(hl)
+	inc	hl
+	ld	b,(hl)		; BC ist Adresse des ersten Elements
+	ex	de,hl
+	ld	e,c
+	ld	d,b		; DE ist Adresse des ersten Elements
+	ld	c,(hl)
+	inc	hl
+	ld	h,(hl)
+	ld	l,c		; HL ist Adresse des zweiten Elements
+	push	hl
+	push	de
+	ld	bc,8		; Trennzeichen nach Dateiname
+	add	hl,bc
+	ex	de,hl
+	add	hl,bc
+	ex	de,hl
+	ld	a,(de)
+	cp	(hl)		; DIR oder Datei?
+	pop	de
+	pop	hl
+	ret	nz		; unterschiedlich
+	ld	b,8		; Vergleich Dateiname
+	call	CMPLE
+	ret	nz		; unterschiedlich
+	inc	de
+	inc	hl		; Trennzeichen uebergehen
+	ld	b,3
+CMPLE:	ld	a,(de)
+	cp	(hl)		; Vergleich
+	inc	de
+	inc	hl
+	ret	nz		; Ende, sobald ungleich
+	djnz	CMPLE
+	ret
+;
+; RESET Vinculum (Menuewort nicht sichtbar!):
+;
+	DW	PROLOG3
+	DB	'reset',1	; verstecktes Menuewort
+	JR	VRESET
+;
+	DW	PROLOG4
+	DB	'reset',1	; verstecktes Menuerwort
+VRESET:	LD	A,ST_RES	; RESET#=0
+	OUT	(PIO52B),A
+	LD	A,ST0		; RESET#=1
+	OUT	(PIO52B),A
+	RET
+;
+; Modus-Umschaltung fuer Terminal (Menuewort nicht sichtbar!):
+;
+	DW	PROLOG3
+	DB	'mode',1	; verstecktes Menuewort
+	JR	MODUS
+;
+	DW	PROLOG4
+	DB	'mode',1	; verstecktes Menuewort
+MODUS:	ld	a,(argn)	; Anzahl Argumente
+	and	a		; Argumente vorhanden?
+	jr	nz,md1		; ja
+	CALL	PV1
+	DB	OSTR
+	DB	0Bh		; Cursor hoch
+	DB	'>mode 0 = normal',cr,lf
+	DB	'>mode 1 = Steuerzeichen',cr,lf
+	DB	'>mode 2 = HEX-Anzeige',cr,lf
+	DB	0
+	ret
+	;
+md1:	ld	a,l		; 1. Parameter verwenden
+if tast
+	OR	8		; Terminal-Mode
+endif
+	ld	(MODE),a
+	DI
+	CALL	STAT		; Statuszeile (unten) anzeigen
+	EI
+	ret
+;
+; HEX-Kommando(s) zu VDIP1 senden (Menuewort nicht sichtbar!):
+;
+	DW	PROLOG3		; KC85/3-Version - nur HEX-Werte
+	DB	'hex',1		; verstecktes Menuewort
+	LD	A,(ARGN)	; Anzahl der Argumente
+	AND	A
+	RET	Z		; kein Argument
+	LD	HL,ARG1		; erster Parameter
+	LD	B,A
+HEX2:	LD	A,(HL)		; Argument aus Kommandozeile lesen
+	CALL	PUTi		; >> USB
+	INC	HL
+	INC	HL
+	DJNZ	HEX2
+	RET
+ 
+	DW	PROLOG4		; KC85/4-Version, auch ,CHAR und 'String'
+	DB	'hex',1Fh	; verstecktes Menuewort mit Textparameter
+	dec	de
+HEX3:	inc	de		; naechstes Zeichen
+	LD	A,(DE)		; Zeichen holen
+	AND	A		; Ende-0 ?
+	RET	Z		; fertig
+;	INC	DE
+	CP	' '		; Leerzeichen ueberspringen
+	JR	Z,HEX3
+	CP	','		; Komma, dann Zeichen danach verwenden
+	JR	NZ,HEX4
+	inc	de		; dem Komma folgendes
+	LD	A,(DE)		; Zeichen aus VRAM entnehmen
+;	INC	DE
+	JR	HEX7
+	;
+HEX4:	CP	27H		; Zeichenkette?
+	JR	NZ,HEX6
+HEX5:	inc	de		; dem Hochkomma folgendes
+	LD	A,(DE)		; Zeichen holen
+;	INC	DE
+	AND	A		; Dummy-Ende?
+	RET	Z
+	CP	27H		; Ende Kette?
+	JR	Z,HEX3
+	CALL	PUTi		; >> USB
+	JR	HEX5
+	;
+HEX6:	CALL	PV1
+	DB	RHEX		; HEX-Zahl erfassen
+	JR	C,HEX8		; fehlerhaft
+	LD	A,(NUMVX)	; Wert der erfassten HEX-Zahl
+	;
+HEX7:	CALL	PUTi		; >> USB
+	JR	HEX3
+	;
+HEX8: 	CALL	PV1
+	DB	ERRM		; ERROR, CR,LF
+	RET
+
+; ===== ab hier Unterprogramme =========================
+
+; Datenblock lesen (128 Byte)
+;
+; PE:	HL	Zieladresse
+;
+; PA:	HL=HL+B	Daten im Puffer
+;	CY=1	Fehler, dann Fehlercode in DE
+; VR:	AF,BC,HL
+;
+RD128:	PUSH	HL		; Zieladrersse
+	LD	HL,(NUMVX)	; Anzahl vollstaendiger Bloecke
+	LD	A,H
+	OR	L		; noch ein kompletter Block lesbar?
+	JR	NZ,REA1		; ja, 128 Byte lesen
+	POP	HL
+	PUSH	HL
+	LD	B,128
+REA0:	LD	(HL),A		; Datenpuffer mit 00H beschreiben
+	INC	HL
+	DJNZ	REA0		; B=0
+	LD	HL,NUMNX
+	LD	C,(HL)		; restliche Anzahl nehmen
+	LD	(HL),A		; jetzt Anzahl auf 0 setzen
+	POP	HL
+	PUSH	HL		; Beginn Zieladresse		
+	ADD	HL,BC		; Anzahl addieren
+	LD	(HL),3		; CAOS-Ende-Zeichen anhaengen
+	OR	C		; waren ueberhaupt noch Bytes lesbar?
+	POP	HL
+	JR	NZ,REA2		; letzten Block mit Groesse < 128 einlesen
+	LD	DE,'FE'		; Fehlercode "File End"
+;	DB	OSTR
+;	DB	'Dateiende',cr,lf,0
+	SCF			; Fehler
+	RET			; keine Daten mehr verfuegbar
+	;
+REA1:	DEC	HL		; gelesene Bloecke runter zaehlen
+	LD	(NUMVX),HL	; und Wert eintragen
+	POP	HL
+ 	LD	BC,128		; vollstaendiger Block
+REA2:	INC	(IX+2)		; naechste Blocknummer
+	CALL	READX		; Datenbytes lesen und in Speicher schreiben
+	LD	(HL),A		; letztes Byte ebenfalls
+	RET			; CY=1 bei Fehler
+;
+; Datei oeffnen zum Lesen
+;
+; PE:	(NAME)	Dateiname 8.3 im Puffer
+; PA:	(IX+2)	Blocknummer = 0
+;	CY=1	Fehler (TimeOut, Datei nicht vorhanden)
+; VR:	AF,HL,BC,DE
+;
+UOPENR:	CALL	TESTX		; Test, ob Datei vorhanden ist
+	RET	C		; Fehler oder nicht vorhanden
+	; Dateigroesse in DEBC (max. 4 GByte)
+	LD	HL,NUMNX
+	LD	(HL),C		; niederwertigstes Byte
+	RES	7,(HL)		; NUMNX = Anzahl Bytes im letzten Block (0-127)
+	INC	HL
+	RL	C		; Bit 7 des 1. Bytes nach CY
+	RL	B		; 2. Byte
+	RL	E		; 3. Byte
+	RL	D		; 4. Byte
+	JR	C,MAX		; groesser 2 GByte
+	JR	Z,NOMAX		; kleiner als 8 MByte
+MAX:	LD	B,0FFH		; Datei groesser als 8 MByte
+	LD	E,B
+NOMAX:	LD	(HL),B		; max. Blockanzahl eintragen
+	INC	HL		; in NUMNX und NUMNX+1
+	LD	(HL),E
+	LD	(IX+3),1	; erwarteter Block = Vorblock
+	LD	(IX+2),0	; Vorblock = Blocknummer 0
+	JP	OPEN1		; Datei zum Lesen oeffnen
+;
+; Datei oeffnen zum Schreiben
+;
+; PE:	(NAME)	Dateiname 8.3 im Puffer
+; PA:	(IX+2)	Blocknummer = 0
+;	CY=1	Fehler (TimeOut, anderer Fehler)
+; VR:	AF,HL,BC,DE
+;
+UOPENW:	LD	(IX+2),0	; Vorblock = Blocknummer 0
+	JP	APP2		; Datei zum Schreiben oeffnen
+;
+; Blocknummer anzeigen und zurueck zu Zeilenanfang
+;
+BLNR:	ld	a,(ix+2)
+	call	pv1
+	db	ahex		; Blocknummer anzeigen
+	call	pv1
+	DB	ostr
+	db	'> ',19h,0	; Cursor an Zeilenanfang
+	ret
+;
+; Dateiname eingeben und speichern,
+; falls nicht angegeben den Standard-Dateityp ergaenzen
+;
+; PE:	HL	Zeiger auf Standard-Dateityp
+; PA:	CY=1	BRK (ab CAOS 4.3)
+;	NAME	Dateiname 8.3
+;
+KCC:	DB	'KCC'		; Standard-Typ, wenn nichts angegeben
+GETKCC:	LD	HL,KCC
+GETNAM:	CALL	PV1
+	DB	OSTR
+	DB	'Name :',0
+	CALL	INPUT
+	RET	C		; BRK ab CAOS 4.3
+GETN0:	PUSH	HL		; Standard-Dateityp merken
+	LD	HL,6
+	ADD	HL,DE		; Beginn der Eingabekette
+	LD	D,H
+	LD	E,L		; DE=Beginn der Eingabekette
+	EX	(SP),HL		; HL=Standard-Dateityp
+
+; Kontrolle, ob Punkt enthalten ist, falls nicht Dateityp anhaengen
+GETN1:	LD	A,(DE)
+	OR	A
+	JR	Z,GETN2		; Ende der Zeichenkette -> Typ anhaengen
+	CP	'.'
+	JR	Z,GETN4		; Punkt erkannt -> Typ schon angegeben
+	INC	DE
+	JR	GETN1
+	;
+GETN2:	LD	B,4		; Punkt + 3 Zeichen ablegen
+	LD	A,'.'		; der Eingabe einen Punkt anfuegen
+GETN3:	LD	(DE),A
+	INC	DE
+	LD	A,(HL)
+	INC	HL
+	DJNZ	GETN3
+	XOR	A		; String-Ende anhaengen
+	LD	(DE),A
+GETN4:	POP	DE		; Beginn der Zeichenkette
+	CALL	PFAD		; evtl. Pfad abtrennen und einstellen
+	RET	C		; Pfad fehlerhaft
+	EX	DE,HL
+	CALL	UNAME		; Name 8.3 konvertieren und ablegen
+	OR	A
+	RET
+
+; Dateiname senden 8.3
+; PE:	NAME	Dateiname, 8 Zeichen fuer Name und 3 fuer Typ
+; PA:	CY=1	Fehler
+;	DE	Fehlercode
+; VR:	AF, (DE bei Fehler)
+;
+OUTNAM:	PUSH	HL
+	PUSH	BC
+	ld	hl,name
+	ld	b,8		; Dateiname
+	call	outn2
+	JR	C,outn1
+	ld	a,'.'		; Trennzeichen
+	call	RAWO1		; ausgeben
+	JR	C,outn1		; TimeOut
+	ld	b,3		; Dateityp
+	call	outn2
+outn1:	POP	BC
+	POP	HL
+	ret
+	;
+outn2:	ld	a,(hl)
+	inc	hl
+	cp	21h
+	jr	c,outn3
+	call	PUTX
+outn3:	djnz	outn2
+	and	a	; CY=0
+	ret
+;
+; 17.02.2024: Datum erst RTC auf Adresse 55h testen (Modul M064), danach erst
+; von DEP 3.0 (D004/D008) holen/konvertieren
+;
+; PA:	(DATUM)	Binaerwerte DOS-Format
+;	CY=1	kein Datum von D004 geholt
+;
+; VR:	BC,HL,AF,DE
+;
+DCONV:	LD	BC,0E55H	; RTC-Register E
+	IN	A,(C)		; ist normalerweise = 0
+	ADD	A,1		; zumindest niemals FF!
+	JR	Z,D004CL	; keine RTC vom M064 gefunden
+
+; RTC: R/W-Zugriff vorbereiten
+RTCWT:	LD	B,0DH		; Steuerregister D
+	LD	A,1
+	OUT	(C),A		; HOLD-Bit setzen
+	IN	A,(C)
+	AND	2		; BUSY?
+	JR	Z,RTCOK		; Zugriff erlaubt
+	XOR	A
+	OUT	(C),A		; HOLD-Bit ruecksetzen
+;	CALL	PV1		; 1,5 Sekunden warten
+;	DB	WAIT
+	JR	RTCWT		; nochmal testen
+	;
+RTCOK:	LD	HL,NUMNX
+	LD	B,9		; Monat Zehner/Einer
+	CALL	BCD55		; Monat zusammensetzen
+	LD	D,(HL)
+	CALL	BCD55		; Tag zusammensetzen
+	LD	E,(HL)
+	LD	B,11		; Jahr Zehner/Einer
+	CALL	BCD55		; Jahr zusammensetzen
+	LD	A,(HL)		; A=Jahr
+	PUSH	DE		; B=Monat
+	POP	BC		; C=Tag
+	CALL	CONV		; Datum konvertieren
+
+	LD	BC,0555H	; RTC-Register 5
+				; Stunde Zehner/Einer
+	CALL	BCD55		; Stunde zusammensetzen
+	LD	D,(HL)
+	CALL	BCD55		; Minute zusammensetzen
+	LD	E,(HL)
+	CALL	BCD55		; Sekunde zusammensetzen
+	LD	B,0DH		; Steuerregister D
+	XOR	A
+	OUT	(C),A		; HOLD-Bit ruecksetzen
+	LD	C,(HL)		; Sekunde
+;
+; Zeit konvertieren von BCD in DOS-Format
+; PE:	HL	DATUM+2 (Zeit)
+;	D	Stunde BCD
+;	E	Minute BCD
+;	C	Sekunde BCD
+; PA:	ZEIT	konvertiert in DOS-Format
+;	HL	DATUM+4
+; VR:	AF, HL, B, E
+;
+TCONV:	LD	B,E		; Minute in B uebernehmen
+	LD	A,D		; Stunde
+	CALL	BCD
+	LD	(HL),A
+	LD	A,B		; Minute
+	CALL	BCD
+	RLA
+	RLA			; 3x nach links rotieren
+	RLA
+	RL	(HL)		; 3 Bit der Minute in erstes Byte
+	RLA			; einschieben nach Bit 0-2
+	RL	(HL)
+	RLA
+	RL	(HL)
+	INC	HL
+	LD	(HL),A		; der Rest in das zweite Byte
+	LD	A,C		; Sekunde
+	CALL	BCD
+	RRA			; /2
+	OR	(HL)		; CY=0 -> OK
+	LD	(HL),A
+	RET
+;
+; D004/D008-Uhrzeit lesen
+;
+D004CL:	LD	BC,0FC80H
+	IN	A,(C)
+	CP	0A7H		; D004 oder D008?
+	SCF
+	RET	NZ		; kein D004
+	LD	BC,0B3F3H
+	IN	A,(C)
+	CP	5		; CAOS-Betriebsart?
+	SCF
+	RET	NZ		; keine CAOS-BA
+	LD	BC,83F1H
+	IN	A,(C)		; DEP-Version?
+	CP	30H
+	RET	C		; < DEP 3.0
+	INC	B
+	IN	A,(C)		; Jahr
+	INC	B
+	IN	D,(C)		; Monat
+	INC	B
+	IN	E,(C)		; Tag
+	PUSH	DE
+	POP	BC
+	CALL	CONV		; Datum konvertieren
+	LD	BC,87F1H
+	IN	D,(C)		; Stunde
+	INC	B
+	IN	E,(C)		; Minute
+	INC	B
+	IN	C,(C)		; Sekunde
+	JR	TCONV		; Zeit konvertieren und ablegen
+;
+; Zwei Register (Zehner+Einer) vom RTC lesen und zusammenfuegen
+; Ablade in (HL)
+;
+BCD55:	IN	A,(C)		; Zehner
+	RLD
+	DEC	B
+	IN	A,(C)		; Einer
+	RLD
+	DEC	B
+	RET
+;
+; Datum konvertieren von BCD in DOS-Format
+; PE:	A	Jahr BCD
+;	B	Monat BCD
+;	C	Tag BCD
+; PA:	DATUM	konvertiert in DOS-Format
+;	HL	DATUM+2
+; VR:	AF, HL, E
+;
+CONV:	CALL	BCD
+	SUB	80		; 1980=0
+	JR	NC,DC1		; 1980-1999
+	ADD	A,100		; 2000-2079
+DC1:	LD	HL,DATUM
+	LD	(HL),A
+	LD	A,B		; Monat
+	CALL	BCD
+	RLA
+	RLA
+	RLA
+	RLA
+	RLA
+	RL	(HL)
+	INC	HL
+	LD	(HL),A
+	LD	A,C		; Tag
+	CALL	BCD
+	OR	(HL)
+	LD	(HL),A
+	INC	HL
+	RET
+
+; BCD -> binaer konvertieren
+;
+; PE:	A	BCD-Zahl
+; PA:	A	Binaerzahl
+;	CY=0
+; VR:	AF, E
+
+BCD:	PUSH	AF
+	RRA
+	RRA
+	RRA
+	RRA
+	AND	0FH	; Zehner
+	LD	E,A
+	INC	E
+	LD	A,-10
+BCD1:	ADD	A,10
+	DEC	E
+	JR	NZ,BCD1
+	LD	E,A
+	POP	AF
+	AND	0FH	; Einer
+	ADD	E
+	RET
+ 
+; CRT-Routine mit DEBUG-Anzeige fuer Terminal-ISR:
+; (nicht mit PV1 wegen DE/EI in dessen Abarbeitung)
+; PE:	A	Zeichencode
+; VR:	AF
+
+CRTn:	push	de		; hier keine Anzeige im Debug-Modus
+	push	af
+	ld	a,(mode)	; Betriebsart testen
+if tast
+	and	3		; nur Bit 1 und 0 testen
+endif
+	dec	a
+	jr	z,MODE1		; nur Steuerzeichen HEX anzeigen
+	dec	a
+	jr	z,MODE2		; alles Hexadezimal
+
+	pop	af
+	pop	de
+	ret
+
+CRTi:	push	de		; Register E retten wegen PV3
+	push	af
+	ld	a,(MODE)	; Betriebsart testen
+	and	3		; nur Bit 1 und 0 testen
+	jr	z,mod6		; keine DEBUG-Anzeigen
+	dec	a
+	jr	z,MODE1		; nur Steuerzeichen HEX anzeigen
+; alles Hexadezimal anzeigen
+MODE2:	pop	af
+	CALL	HEX80		; Hexadezimal anzeigen
+	cp	cr
+	jr	z,mod21		; nach Anzeige 0D: CR+LF auch noch ausfuehren
+	ld	a,' '		; sonst Leerzeichen dazwischen
+mod21:	CALL	CRTX
+	pop	de
+	ret
+
+; Steuerzeichen Hexadezimal anzeigen
+MODE1:	pop	af
+	cp	cr
+	jr	z,mod3		; CR als Steuerzeichen anzeigen
+	cp	' '
+	jr	z,mod2		; Leerzeichen mit CAOS-Code 00 anzeigen
+	jr	c,mod1		; Steuerzeichen 00h..1Fh
+	cp	7fh
+	jr	c,mod7		; ASCII-Zeichen 21h..7Eh anzeigen
+mod1:	CALL	HEX80		; Hexadezimal anzeigen
+	jr	mod4
+	;
+mod2:	xor	a		; statt Leerzeichen CAOS 00 anzeigen!
+mod3:	push	hl
+	ld	hl,STBT		; Bildschirmsteuerbyte
+;	res	5,(hl)		; CAOS-Zeichensatz ein
+	set	3,(hl)		; Steuerzeichen darstellen
+	LD	E,CRT
+	CALL	PV3		; Zeichen darstellen
+;	set	5,(hl)		; IBM-Zeichensatz ein
+	res	3,(hl)		; Steuerzeichen ausfuehren
+	pop	hl
+mod4:	cp	cr
+	jr	nz,mod5
+	ld	a,(curso)	; Spalte
+	and	a		; bereits ganz links?
+	ld	a,CR
+	CALL	nz,CRTX		; CR+LF ausfuehren wenn nicht in neuer Zeile
+mod5:	pop	de
+	ret
+	;
+mod6:	pop	af
+mod7:	db	1eh	; LD E,n
+;
+; Spezial-CRT-Routine (CR -> CR+LF und Sonderbehandlung Backslash + Tilde)
+; PE:	A	Zeichencode
+; VR:	AF
+;
+CRTX:	PUSH	DE
+CRTX1:	PUSH	HL
+	LD	HL,STBT
+	SET	5,(HL)		; IBM-Zeichensatz ab CAOS 4.3
+	LD	HL,(CCTL0)	; Zeichenbildtabelle fuer 20..5Fh
+	PUSH	HL		; retten
+	LD	HL,(CCTL1)	; Zeichenbildtabelle fuer 0..1Fh und 60-7Fh
+	PUSH	HL		; retten
+	CP	5CH		; Backslash?
+	JR	Z,CRTX2
+	CP	7EH		; Tilde?
+	JR	NZ,CRTX3
+	LD	HL,ZEI7E-01F0h	; Zeichencode fuer Tilde
+	LD	(CCTL1),HL
+	JR	CRTX3
+	;
+CRTX2:	LD	HL,ZEI5C-01E0h	; Zeichencode fuer Backslash
+	LD	(CCTL0),HL
+CRTX3:	LD	E,CRT
+	CALL	PV3		; Zeichen anzeigen
+	CP	CR
+	LD	A,LF		; LF anhaengen
+	CALL	Z,PV3		; falls es CR war
+	LD	HL,STBT
+	RES	5,(HL)		; CAOS-Zeichensatz
+	POP	HL
+	LD	(CCTL1),HL	; Zeichenbildtabelle 1 regenerieren
+	POP	HL
+	LD	(CCTL0),HL	; Zeichenbildtabelle 0 regenerieren
+	POP	HL
+	POP	DE
+	RET
+
+;------ Eingabe ------
+;
+; PA:	A	Datenbyte
+;	CY=1	keine Daten verfuegbar
+; VR:	AF				keine Daten verfuegbar: 26 Takte
+				;	wenn Daten verfuegbar:	98 Takte
+GET:	IN	A,(PIO52B)	;				11
+	RRCA			;				4
+	RET	C		; keine Daten vorhanden		11 (5)
+GET1:	LD	A,ST_RD		; RD#=0 (aktiv)			7
+	OUT	(PIO52B),A	;				11
+	IN	A,(PIO52A)	; Daten holen			11
+	PUSH	AF		;				11
+	LD	A,ST0		; RD#=1 (inaktiv)		7
+	OUT	(PIO52B),A	;				11
+	POP	AF		;				10
+	RET			;				10
+
+;							===============
+; RAWIN: direktes Lesen eines Bytes vom VNC		USER-Funktion 3
+; mit TimeOut-Ueberwachung				===============
+; (TimeOut: 59*60.000 Takte = ca. 2 Sekunden)
+;
+; PA:	A	Datenbyte
+;	CY=0	OK
+;	CY=1	TimeOut oder falscher Interruptmode, dann
+;	DE	Fehlercode
+; VR:	AF, (DE bei Fehler)
+;
+RAWIN:	LD	A,(MODE)
+	AND	0Ch		; Bit 2+3 (Interruptmode) testen
+	CP	4
+	JR	Z,RAWI0		; USER/FILE-Mode: OK
+	LD	DE,'MD'		; Fehlercode "falsche Betriebsart"
+	SCF			; Fehlerflag
+	RET
+	;			;			Schleife=59 Takte
+RAWI0:	PUSH	BC		; BC nicht veraendern
+	LD	BC,60000	; Zeitkonstante fuer TimeOut
+RAWI1:	call	get		; Daten holen			26
+	JR	NC,RAWI2	; OK, Daten verfuegbar		7 (12)
+	dec	bc		;				6
+	ld	a,b		;				4
+	or	c		;				4
+	jr	nz,RAWI1	; Zeit abwarten...		12
+	LD	DE,'TO'		; Fehlercode "TimeOut"
+	scf			; Fehlerflag
+RAWI2:	POP	BC
+	ret
+	;
+GETX:	CALL	RAWI0		; Datenbyte lesen
+	RET	NC		; OK, kein TimeOut
+	POP	AF		; Stack eine Ebene hoeher
+	SCF			; Fehlerkennung erneuern
+	RET
+;------ Ausgabe ------
+;
+; PE:	A	Datenbyte
+; VR:	AF, AF'
+;
+PUTi:	push	af		; Datenbyte
+	ld	a,(mode)
+if tast
+	and	3		; nur Bit 1 und 0 testen
+	jr	z,debug5	; keine Debug-Anzeigen
+else
+	dec	a
+	jr	z,debug4	; DEBUG-Mode 1 oder 2?
+	dec	a
+	jr	nz,debug5	; alles andere ohne Debug-Anzeigen
+endif
+;	DI			; damit kein Interrupt unterbricht
+debug4:	pop	af
+	PUSH	HL
+	PUSH	DE
+	PUSH	BC
+	push	af
+	ld	a,(winnr)	; aktuelles Fenster in A' merken
+	ex	af,af'
+	CALL	WINR1		; in Terminal-Fenster wechseln
+	LD	A,14H		; rot/gruen
+	LD	(COLOR),A
+	pop	af
+	push	af
+	CALL	CRTi		; anzeigen je nach Mode
+	LD	A,3CH		; weiss/gruen
+	LD	(COLOR),A
+	ex	af,af'
+	CALL	WIN		; zurueck zu akt. Fenster
+	pop	af
+	POP	BC
+	POP	DE
+	POP	HL
+	push	af
+;	EI
+debug5:	JR	RAWO0		; Datenbyte ausgeben
+
+;							===============
+; RAWOUT: direktes Schreiben eines Bytes in den VNC	USER-Funktion 2
+; mit TimeOut-Ueberwachung				===============
+; (TimeOut: 52*65536 Takte = ca. 2 Sekunden)
+;
+; PE:	A	Datenbyte
+; PA:	CY=0	OK
+;	CY=1	TimeOut oder falscher Interruptmode, dann
+;	DE	Fehlercode
+; VR:	AF, (DE bei Fehler)
+;
+RAWOUT:	PUSH	AF
+	LD	A,(MODE)
+	AND	0Ch		; Bit 2+3 (Interruptmode) testen
+	CP	4
+	JR	Z,RAWO0		; USER/FILE-Mode: OK
+	POP	AF
+	LD	DE,'MD'		; Fehlercode "falsche Betriebsart"
+	SCF			; Fehlerflag
+	RET
+	;
+RAWO0:	POP	AF		;			Schleife=52 Takte
+RAWO1:	OUT	(PIO52A),A	; Daten
+	PUSH	BC
+	LD	BC,0		; Zeitkonstante fuer TimeOut
+RAWO2:	IN	A,(PIO52B)	;				11
+	RRCA			;				4
+	RRCA			;				4
+	JR	NC,RAWO3	; OK, bereit zum Schreiben	7 (12)
+	dec	bc		;				6
+	ld	a,b		;				4
+	or	c		;				4
+	jr	nz,RAWO2	; Zeit abwarten...		12
+	POP	BC
+	LD	DE,'TO'
+	scf			; Fehlerflag
+	ret
+	;
+RAWO3:	POP	BC
+	LD	A,ST_WR		; WR=1 (aktiv)
+	OUT	(PIO52B),A
+	LD	A,ST0		; WR=0 (inaktiv)
+	OUT	(PIO52B),A
+	RET
+	;
+PUTX:	CALL	RAWO1		; Datenbyte ausgeben
+	RET	NC		; OK, kein TimeOut
+	POP	AF		; Stack eine Ebene hoeher
+	SCF			; Fehlerkennung erneuern
+	RET
+; ----- Synchronisieren mit Vinculum (mit Anzeige) ----
+;
+; PA:	CY=0 OK		CY=1 Fehler
+;
+; VR:	AF,BC
+;
+LEER:
+if tast
+	LD	A,(MODE)
+	OR	4		; File-Mode einstellen
+	LD	(MODE),A
+endif
+leer0:	ld	bc,20000	; Konstante x fuer Zeitschleifen
+leer1:	CALL	GET		; Daten holen
+	jr	c,leer2		; keine Daten vorhanden
+	call	CRTi		; Daten anzeigen
+	jr	leer0		; bis alles abgeholt ist
+	;
+leer2:	dec	bc		; Zaehler
+	ld	a,b
+	or	c
+	jr	nz,leer1	; x-mal kontrollieren (warten)...
+
+leer3:	in	a,(PIO52B)	; Status abfragen
+	rrca
+	rrca
+	jr	nc,leer4	; bereit, Daten zu schreiben
+	dec	c
+	jr	nz,leer3	; noch 256mal versuchen
+	PUSH	AF
+	jp	Timout		; "TimeOut-ERROR" anzeigen
+	;
+leer4:	djnz	leer3		; 256mal kontrollieren...
+	in	a,(PIO52B)
+	and	3		; nur Bit 0 und 1 auswerten
+	cp	1		; alle Daten abgeholt und bereit zum schreiben?
+	jr	nz,leer		; nein, von vorn beginnen !
+; 1. cr
+	ld	a,cr
+	call	PUTi		; <cr> muss irgendwie <cr> zurueckgeben
+leer5:	call	GETX
+	push	af
+	call	CRTn		; nur im Debug-Mode anzeigen
+	pop	af
+	cp	cr
+	jr	nz,leer5	; wiederholen bis <cr> kommt
+; 2. E,cr
+	ld	a,'E'		; E <cr> muss E <cr> zurueckgeben
+	call	PUTi
+	ld	a,cr
+	call	PUTi
+leer6:	call	GETX		; Daten holen
+	push	af
+	call	CRTn		; nur im Debug-Mode anzeigen
+	pop	af
+leer7:	cp	'E'
+	jr	nz,leer6	; wiederholen bis "E" kommt
+	call	GETX
+	push	af
+	call	CRTn		; nur im Debug-Mode anzeigen
+	pop	af
+	cp	cr
+	jr	nz,leer7	; wiederholen bis "E",cr kommt
+; 3. e,cr
+	ld	a,'e'		; e <cr> muss e <cr> zurueckgeben
+	call	PUTi
+	ld	a,cr
+	call	PUTi
+leer8:	call	GETX		; Daten abholen
+	push	af
+	call	CRTn		; nur im Debug-Mode anzeigen
+	pop	af
+leer9:	cp	'e'
+	jr	nz,leer8	; wiederholen bis "e" kommt
+	call	GETX
+	push	af
+	call	CRTn		; nur im Debug-Mode anzeigen
+	pop	af
+	cp	cr
+	jr	nz,leer9	; wiederholen bis "e",cr kommt
+	ret
+
+; ----- Synchronisieren mit Vinculum (ohne Anzeige) ----
+;
+; PA:	CY=0 OK		CY=1 Fehler
+;
+; VR:	AF,BC
+;
+sync:
+if tast
+	INTOF			; File-Mode einstellen
+sync0:
+endif
+	ld	bc,0		; fuer Zeitschleifen
+sync1:	CALL	GET		; Daten holen
+	jr	nc,sync1	; bis alles abgeholt ist
+	djnz	sync1		; 256mal kontrollieren...
+sync2:	in	a,(PIO52B)	; Status abfragen
+	rrca
+	rrca
+	jr	nc,sync3	; bereit, Daten zu schreiben
+	dec	c		; CY unveraendert = 1
+	jr	nz,sync1	; noch 256mal versuchen
+	RET			; TimeOut
+	;
+sync3:	djnz	sync2		; 256mal kontrollieren...
+	in	a,(PIO52B)
+	and	3		; nur Bit 0 und 1 auswerten
+	cp	1		; alle Daten abgeholt und bereit zum schreiben?
+	jp	nz,sync1	; nein !
+; 1. cr
+	ld	a,cr
+	call	PUTX		; <cr> muss irgendwie <cr> zurueckgeben
+sync4:	call	GETX
+	cp	cr
+	jr	nz,sync4	; wiederholen bis <cr> kommt
+; 2. E,cr
+	ld	a,'E'		; E <cr> muss E <cr> zurueckgeben
+	call	PUTX
+	ld	a,cr
+	call	PUTX
+sync5:	call	GETX		; Daten holen
+sync6:	cp	'E'
+	jr	nz,sync5	; wiederholen bis "E" kommt
+	call	GETX
+	cp	cr
+	jr	nz,sync6	; wiederholen bis "E",cr kommt
+; 3. e,cr
+	ld	a,'e'		; e <cr> muss e <cr> zurueckgeben
+	call	PUTX
+	ld	a,cr
+	call	PUTX
+sync7:	call	GETX		; Daten abholen
+sync8:	cp	'e'
+	jr	nz,sync7	; wiederholen bis "e" kommt
+	call	GETX
+	cp	cr
+	jr	nz,sync8	; wiederholen bis "e",cr kommt
+	ret
+;
+; Test ob vorhandene Datei ueberschrieben werden soll:
+;
+; PA:	CY=1	Datei vorhanden - Abbruch, oder unerwartete Antwort!
+;	CY=0	Datei nicht vorhanden oder erfolgreich geloescht
+; VR:	AF, HL,DE,BC
+;
+UTEST:	CALL	TESTX		; Datei vorhanden?
+	JR	NC,UT3		; kein Fehler beim Oeffnen = Datei vorhanden
+	ld	hl,'FI'
+	AND	A
+	sbc	hl,de		; Datei nicht vorhanden (Firmware 3.64)
+	ret	z		; FI-Error erkannt -> OK
+	ld	hl,'CF'
+	and	a
+	sbc	hl,de		; Datei nicht vorhanden (Firmware 3.66)
+	ret	z		; CF-Error erkannt -> OK
+; Errorcode anzeigen
+	SCF
+	JP	ERRX		; (kann eigentlich nur FO = "File open" sein)
+	;
+UT3:	CALL	PV1
+	DB	OSTR
+	db	'Datei ueberschreiben (j/n)? ',0
+if tast
+	CALL	CMODE		; Tastatureingaben erlauben
+ask:	call	pv1
+	db	kbd		; Tastatureingabe abwarten
+	and	5fh		; upcase
+	cp	'N'
+	jr	z,TOK		; nein
+	cp	'J'
+	jr	nz,ask
+TOK:	push	af
+	INTOF			; wieder zum File-Mode
+	pop	af
+else
+ask:	call	pv1
+	db	kbd		; Tastatureingabe abwarten
+	and	5fh		; upcase
+	cp	'N'
+	jr	z,TOK		; nein
+	cp	'J'
+	jr	nz,ask
+TOK:
+endif
+	call	PV1
+	DB	CRT		; Zeichen J oder N anzeigen
+	CALL	LFCR		; neue Zeile
+	cp	'J'
+	LD	DE,'BK'		; BK = Code fuer Abbruch
+	SCF			; "N"icht ueberschreiben = Abbruch
+	ret	NZ
+
+; vorhandene Datei loeschen
+	LD	A,DLF		; Delete File
+	DB	21H		; LD HL,nn
+;
+; geoeffnete Datei schliessen:
+;
+; PA:	CY=1	Error
+; VR:	HL,AF (DE im Fehlerfall)
+;
+UCLOSE:	LD	A,CLF		; Close File
+	CALL	PUTX
+	LD	A,' '
+	CALL	PUTX
+	CALL	OUTNAM		; Dateiname
+	JP	EXEC
+ADEZ:	CP	10
+	JR	NC,ADEZ1
+	PUSH	AF
+	LD	A,'0'		; fuehrende 0
+	CALL	CRTX		; anzeigen
+	POP	AF
+ADEZ1:	ld	l,a
+	ld	h,0
+;
+; Dezimalausgabe des Wertes in HL (freier Speicher, USER-Bereich, Zeile/Spalte)
+; PE:	HL	Zahl
+; VR:	AF, HL, BC
+;
+HLDEZI:	PUSH	DE		; bei Rekursion: letzten Rest retten
+	LD	BC,-10
+	LD	DE,-1		; Zaehler fuer Ergebnis (Anzahl Sub's)
+HLDEZ1:	ADD	HL,BC
+	INC	DE
+	JR	C,HLDEZ1	; DE = HL/10
+	LD	BC,10
+	ADD	HL,BC		; letzten Abzug korrigieren; HL = Rest
+	EX	DE,HL		; 10er / Rest tauschen
+	LD	A,H
+	OR	L		; Zehner = 0 ?
+	CALL	NZ,HLDEZI	; Rekursion wenn Zehner vorhanden
+	LD	A,E
+	ADD	A,'0'		; Rest -> ASCII in A
+	CALL	CRTX		; Ziffer ausgeben
+	POP	DE		; voriger Rest
+	RET
+;
+; Maske aus Eingabe erzeugen (entnommen aus ML/NC):
+; PE:	HL	Eingabestring
+; PA:	HL	Zeiger auf Trennzeichen nach Maske
+; VR:	AF,B,DE,HL
+;
+GETMSK:	LD	A,(HL)		; erstes Zeichen testen
+	CP	21h		; Eingabe vorhanden?
+	LD	DE,NAME+11
+	LD	B,11		; Laenge der Maske
+	LD	A,'?'		; *.* vorgeben
+	JR	C,NM0
+	LD	A,' '		; sonst leere Maske
+NM0:	DEC	DE
+	LD	(DE),A
+	DJNZ	NM0
+	RET	C		; keine Eingabe
+	LD	B,8		; max. 8 Zeichen testen
+NM1:	LD	A,(HL)
+	cp	21h
+	RET	c		; Ende wenn < 21h
+	INC	HL
+	CP	'.'
+	JR	Z,NM4		; weiter mit Typ
+	CP	'*'
+	JR	Z,NM2		; Joker fuer Rest
+	LD	(DE),A
+	INC	DE
+	DJNZ	NM1
+	JR	NM3		; fertig mit Name
+	;
+NM2:	LD	A,'?'		; Joker in Dateiname
+	LD	(DE),A
+	INC	DE
+	DJNZ	NM2
+NM3:	LD	A,(HL)
+	CP	'.'		; Punkt nach Name?
+	JR	NZ,NM4
+	INC	HL
+NM4:	LD	DE,NAME+8	; Dateityp
+	LD	B,3		; max. 3 Zeichen testen
+NM5:	LD	A,(HL)
+	cp	21h
+	RET	c		; Ende wenn < 21h
+	INC	HL
+	CP	'*'
+	JR	Z,NM6		; Joker fuer Rest
+	LD	(DE),A
+	INC	DE
+	DJNZ	NM5
+	RET
+	;
+NM6:	LD	A,'?'		; Joker in Dateityp
+	LD	(DE),A
+	INC	DE
+	DJNZ	NM6
+	RET
+if tast
+; ===== neue ISR fuer Terminal und Tastatur =====
+; ISR-Aufruf im RAM0, Sprung zur Bearbeitung in M052-ROM
+; wird in RAM-0 kopiert und dort abgearbeitet - verschieblich!
+;
+ISRX:	PUSH	BC
+	PUSH	AF
+; 1. CAOS-C aus
+	LD	A,(IX+4)
+	PUSH	AF		; OUT86 retten
+	AND	7FH		; CAOS-C ausschalten
+	LD	(IX+4),A
+	OUT	(86H),A
+; 2. USER-ROM aus
+	IN	A,(PIOAD)
+	PUSH	AF		; Zustand von PIO-A merken
+	RES	7,A		; USER-C ausschalten
+	OUT	(PIOAD),A
+; 3. Modul direkt ein
+STPL1	EQU	$+2		; Steckplatz wird hier in ISR eingetragen
+	LD	BC,80h		; Modulsteuer-Adresse
+	LD	A,0C5h		; USB-ROM auf C000 und PIO's ein
+	OUT	(C),A		; direkt schalten
+; 4. Sprung in ROM
+	CALL	ISRC		; ISR im M052-ROM aufrufen
+; 5. Modul wie vor Interrupt schalten
+STPL2	EQU	$+2		; Steckplatz wird hier in ISR eingetragen
+	LD	BC,80h		; Modulsteuer-Adresse
+STPL3	EQU	$+1
+	LD	A,0C5h		; M052 wie vorher
+	OUT	(C),A		; direkt schalten wie vor Interrupt
+; 6. USER-ROM wie vor Interrupt
+	POP	AF
+	OUT	(PIOAD),A	; IRM wie vor Interrupt
+; 7. CAOS-C wie vor Interrupt schalten
+	POP	AF
+	LD	(IX+4),A
+	OUT	(86H),A
+
+	POP	AF
+	POP	BC
+	EI
+	RETI
+ENDX:
+; ===	Ende der ISR im RAM0   ===
+
+; ----- ISR fuer Tastatur und Terminal im ROM (PIO-B) ----------
+; (IRM ist noch nicht ein!)
+; Zunaechst IRM kurz einschalten um den aktuellen Schaltzustand des M052
+; zu ermitteln und damit die ISR im RAM0 zu modifizieren
+; (Bei IRM=ON wird Stack nicht benutzt!)
+; Unterscheidung ob Interrupt von FIFO oder Tastatur
+;	-> Abfrage der seriellen Tastatur-Signale
+;	   dann Tastencode seriell abholen und aktivieren falls nicht 0
+;	-> FIFO-Daten entsprechend MODE behandeln
+; --------------------------------------------------------------
+ISRC:	PUSH	DE
+	push	hl
+	IN	A,(PIOAD)
+	LD	D,A		; Zustand von PIO-A in Register D merken
+	SET	2,A		; IRM einschalten
+	OUT	(PIOAD),A
+if isrix
+	ld	l,(ix-32)	; Adresse der aktuellen ISR
+	ld	h,(ix-31)	; ermitteln aus der ISR-Tabelle
+else
+	LD	hl,(01D0H)	; aktuelle ISR ermitteln aus ISR-Tabelle
+endif
+	ld	bc,stpl1-isrx	; Abstand zum Steckplatz
+	add	hl,bc
+	ld	a,(hl)		; Steckplatz aus ISR auslesen
+	ld	bc,stpl3-stpl1	; Abstand zu Schaltzustand
+	add	hl,bc		; berechnen
+	LD	C,A
+	LD	B,High(MODST)	; Modulsteuerbyte-Tabelle im IRM
+	LD	A,(BC)		; aktueller Schaltzustand des M052
+	ld	(hl),a		; Zustand in ISR eintragen
+	LD	A,D
+	OUT	(PIOAD),A	; IRM wie zuvor
+	pop	hl
+	POP	DE
+
+	IN	A,(PIO52B)
+	BIT	5,A		; ist Bit 5 (Tastatur) der Ausloeser?
+	JR	NZ,IFIFO	; nein, FIFO-Daten
+
+; Tastatur-Interrupt
+; wir starten mit C=80h, nach 8x RR C ist CY=1 => 8 Datenbit eingelesen
+	LD	C,80h		; Startwert
+LOOP1:	RES	4,A		; DATAREQ#=0			 8 Takte
+	OUT	(PIO52B),A	; Quittierung			11 Takte
+	LD	B,30		; Wait 0,56 Mikrosekunden*T	 4 Takte
+	DJNZ	$		; 1. Warteschleife		13/8 Takte
+	IN	A,(PIO52B)	; Datenbit holen		11 Takte
+	RLCA			;				 4 Takte
+	RLCA			;				 4 Takte
+	RLCA			; Datenbit jetzt in CY		 4 Takte
+	RR	C		; CY -> (7-0) in C-Register	 8 Takte
+	IN	A,(PIO52B)	; 				11 Takte
+	SET	4,A		; DATAREQ#=1			 8 Takte
+	OUT	(PIO52B),A	; naechstes Bit anfordern	11 Takte
+; 2. Schleife laut D. Lepies nicht mehr erforderlich
+;	LD	B,30		; Wait 0,56 Mikrosekunden*T	 4 Takte
+;	DJNZ	$		; 2. Warteschleife		13/8 Takte
+	JR	NC,LOOP1	; bis 8 Bit eingelesen sind	13/8 Takte
+				; nach 8 Bit kommt CY=1 von RR C
+	LD	(IX+13),C	; Tastencode eintragen
+	JR	Z,IFF0		; Code=0 (Taste losgelassen)
+				; Z-Flag wird vom letzten RR C gesetzt
+	SET	0,(IX+8)	; alles andere gueltig machen
+;	RET
+
+; 13.04.2021
+; Falls der Interrupt eines Tastencodes (Loslassen) und die FIFO-Daten relativ
+; zeitgleich eintreffen: nach dem Einlesen des Tastencodes noch die FIFO-Daten
+; beruecksichtigen:
+
+IFF0:	IN	A,(PIO52B)	; liegen zeitgleich auch noch FIFO-Daten an?
+	RRCA			; Bit 0 testen
+	RET	C		; nein, fertig
+
+; FIFO-Interrupt
+; je nach MODE entscheiden was mit den FIFO-Daten passiert
+;
+IFIFO:	LD	A,(MODE)
+	AND	00001100b	; nur Bit 2 und 3 testen
+	JP	Z,GET1		; 0=CAOS-Mode: FIFO-Daten abholen
+	CP	4
+	RET	Z		; 1=File-Mode: FIFO-Daten lassen
+
+; 2=Terminal-Mode: FIFO-Daten abholen und im Terminal-Fenster anzeigen
+; (hier kann der IRM jetzt gefahrlos eingeschaltet werden)
+
+	LD	A,3		; PIO-Interrupt AUS
+	OUT	(PIO52BS),A
+
+ISRF0:	IN	A,(PIOAD)
+	PUSH	AF		; Zustand von PIO-A merken
+	SET	2,A		; IRM einschalten
+	OUT	(PIOAD),A
+
+	LD	A,(IX+1)
+	PUSH	AF		; OUT84 retten
+	AND	0FDH		; Pixelebene
+	LD	(IX+1),A
+	OUT	(84H),A
+
+	PUSH	HL
+	PUSH	DE
+	CALL	WINR1		; Terminal-Fenster
+	LD	A,34H		; gelb/gruen
+	LD	(COLOR),A
+ISRF1:	CALL	GET		; Datenbyte holen
+	JR	C,ISRF2		; keine Daten mehr vorhanden
+	CALL	CRTi		; Datenbyte anzeigen
+	JR	ISRF1		; naechstes Datenbyte
+	;
+ISRF2:	LD	A,3CH		; weiss/gruen
+	LD	(COLOR),A
+	CALL	WINR2		; Menue-Fenster
+	POP	DE
+	POP	HL
+
+	POP	AF
+	LD	(IX+1),A
+	OUT	(84H),A		; OUT84 wie Interrupt
+
+	POP	AF
+	OUT	(PIOAD),A	; IRM wie vor Interrupt
+
+; 12.04.2021:
+; Falls nach der Umstellung der Fenster noch ein FIFO-Datenbyte eingegangen ist,
+; wird das hier noch einmal geprueft und die Schleife nochmals angesteuert
+
+	IN	A,(PIO52B)	; nochmals nachsehen, ob nicht noch Daten
+	RRCA			; Bit 0 testen
+	JR	NC,ISRF0	; doch -> nochmals Abholung einleiten
+
+	LD	A,83H		; PIO-Interrupt EIN
+	OUT	(PIO52BS),A
+	RET
+
+else	; tast
+
+; ----- ISR fuer Terminal (PIO-B) ----
+; wird in RAM-0 kopiert und dort abgearbeitet!
+;
+; Diese ISR holt Byte fuer Byte ab und stellt diese im Terminal-Fenster
+; dar bis keine Daten mehr anliegen. Der Interrupt vom USB-PIO wird
+; gesperrt solange Daten abgeholt werden und erst wieder freigegeben wenn keine
+; Daten mehr anliegen. Der globale Interrupt wird sofort wieder freigegeben.
+;
+ISRC:	PUSH	AF		; AF retten
+	INTOF			; Interrupt von USB-PIO AUS
+	EI			; Interrupt global wieder ein
+
+	LD	A,(IX+4)
+	PUSH	AF		; OUT86 retten
+	AND	7FH		; CAOS-C off
+	LD	(IX+4),A
+	OUT	(86H),A
+
+	LD	A,(IX+1)
+	PUSH	AF		; OUT84 retten
+	AND	0FDH		; Pixelebene
+	LD	(IX+1),A
+	OUT	(84H),A
+
+	PUSH	HL
+	PUSH	DE
+	PUSH	BC
+	CALL	WINR1		; Terminal-Fenster
+	LD	A,34H		; gelb/gruen
+	LD	(COLOR),A
+ISRC1:	CALL	GET
+	JR	C,ISRC2		; keine Daten mehr vorhanden
+	CALL	CRTi		; Datenbyte anzeigen
+	JR	ISRC1		; naechstes Datenbyte
+	;
+ISRC2:	LD	A,3CH		; weiss/gruen
+	LD	(COLOR),A
+	CALL	WINR2		; Menue-Fenster
+	POP	BC
+	POP	DE
+	POP	HL
+
+	POP	AF
+	LD	(IX+1),A
+	OUT	(84H),A
+	POP	AF
+	LD	(IX+4),A
+	OUT	(86H),A
+
+	INTON			; Interrupt USB-PIO wieder EIN
+	POP	AF
+	RETI
+ENDISR:
+endif	; tast
+;
+; neue ISR CTC2 fuer Zeitanzeige im Terminal-Betrieb
+; wird in RAM-0 kopiert und dort abgearbeitet!
+;
+ISRC3:	CALL	IRET-ISRC3+ISR2	; Interrupts wieder freigeben
+	PUSH	AF
+	LD	A,(IX+4)
+	PUSH	AF		; OUT86 retten
+	AND	7FH		; CAOS-C off
+	LD	(IX+4),A
+	OUT	(86H),A
+
+	CALL	ZEIT		; Zeitanzeige aktualisieren
+
+	POP	AF
+	LD	(IX+4),A
+	OUT	(86H),A		; Port 86H wie vor Interrupt
+	POP	AF
+	RET
+	;
+IRET:	EI
+	RETI
+ENDISC:
+;
+; Unterprogramm zur Zeitanzeige (Aktualisierung per Interrupt alle 5 Sekunden)
+; VR:	AF
+;
+ZEIT:	PUSH	HL
+	PUSH	DE
+	PUSH	BC
+
+	LD	A,(IX+1)
+	PUSH	AF		; OUT84 retten
+	AND	0FDH		; Pixelebene
+	LD	(IX+1),A
+	OUT	(84H),A
+
+	LD	A,(WINNR)	; aktuelles Fenster merken
+	PUSH	AF
+	CALL	WINR0		; CAOS-Fenster aktivieren
+
+	CALL	DCONV		; Uhr lesen
+	LD	A,29H		; tuerkis/blau
+	LD	(COLOR),A
+	LD	HL,1F17H
+	LD	(CURSO),HL	; Position = Datum und Uhrzeit
+; Datum anzeigen:
+	ld	a,(datum+1)
+	and	1fh		; Tag
+	CALL	ADEZ		; dezimal 2stellig anzeigen
+	ld	a,'.'
+	call	pv1
+	db	crt
+	ld	hl,(Datum)
+	ld	a,h
+	srl	l
+	rra
+	rra
+	rra
+	rra
+	rra
+	and	0fh		; Monat
+	CALL	ADEZ		; dezimal 2stellig anzeigen
+	ld	a,'.'
+	call	pv1
+	db	crt
+	ld	a,(datum)
+	srl	a
+	ld	l,a
+	ld	h,0
+	ld	de,1980		; Jahr
+	add	hl,de
+	call	HLDEZI		; dezimal anzeigen
+	call	pv1
+	db	space
+; Uhrzeit anzeigen
+	ld	a,(datum+2)	; Stunde
+	srl	a
+	srl	a
+	srl	a
+	CALL	ADEZ		; dezimal 2stellig anzeigen
+	ld	a,':'
+	call	pv1
+	db	crt
+	ld	hl,(datum+2)	; Minute
+	ld	a,h
+	ld	h,l
+	ld	l,a
+	add	hl,hl
+	add	hl,hl
+	add	hl,hl
+	ld	a,h
+	and	3fh
+	CALL	ADEZ		; dezimal 2stellig anzeigen
+;	ld	a,':'
+;	call	pv1
+;	db	crt
+;	ld	a,(datum+3)
+;	and	1fh		; Sekunde
+;	add	a,a		; *2
+;	CALL	ADEZ		; dezimal 2stellig anzeigen
+
+	POP	AF		; urspruengliches Fenster
+	CALL	WIN		; wiederherstellen
+
+	POP	AF
+	LD	(IX+1),A
+	OUT	(84H),A		; Port 84H wie vor Interrupt
+
+	POP	BC
+	POP	DE
+	POP	HL
+	RET
+;
+; Vinculum synchronisieren, Short CMD, HEX-Modus, Interrupt=Filemode
+; PA:	CY=1	Fehler, dann DE=Fehlercode
+; VR:	AF,BC, (DE bei Fehler)
+;
+USYNC:	call	sync		; mit Vinculum synchronisieren (ohne Anzeige)
+	RET	C		; TimeOut
+
+	LD	A,SCS		; Short CMD
+	CALL	PUTX
+	LD	A,CR		; Kommandoabschluss
+	CALL	PUTX
+	CALL	PRMT		; Prompt abholen
+	RET	C		; Error
+
+	LD	A,IPH		; HEX- bzw. BIN-Modus
+	CALL	PUTX
+;
+; Kommando ausfuehren (im Modus Short CMD):
+; - CR senden
+; - Prompt entgegen nehmen oder Fehlercode
+;
+; PA:	CY=0	Kommando erfolgreich
+;	CY=1	Fehler, dann
+;	DE	Fehlercode
+; VR:	AF, (DE nur bei Fehler)
+;
+EXEC:	LD	A,CR		; Kommandoabschluss
+	CALL	PUTX
+PRMT:	;Prompt,CR vom VNC abholen oder Fehlercode,CR
+	CALL	GETX		; Ergebnis holen
+	CP	'>'		; Prompt?		
+	JR	NZ,GETERR	; nein, dann Fehler
+	CALL	GETX
+	CP	CR		; Zeilenende?
+	RET	Z		; OK
+;	JR	NZ,GETERR	; nein, dann Fehler
+;	CALL	PV1
+;	DB	BRKT
+;	RET	NC		; kein BREAK
+;	LD	DE,'BK'		; Fehlercode
+;	RET
+	;
+GETERR:	LD	D,E		; erstes Zeichen vom Fehlercode nach D
+	LD	E,A		; zweites Zeichen vom Fehlercode nach E
+	CALL	GETX		; naechstes Zeichen holen
+	CP	CR		; auch Fehlercodes enden mit CR
+	JR	NZ,GETERR	; weiter bis CR kommt
+	SCF			; Fehler-Flag setzen
+	RET
+;
+; Hexadezimale Anzeige der Debugging-Codes, die nicht darstellbar sind
+; PE:	A	Code
+; VR:	-
+;
+HEX80:	PUSH	HL
+	PUSH	DE
+	PUSH	BC
+	PUSH	AF
+	PUSH	AF		; Zeichen
+	RRCA
+	RRCA
+	AND	3Ch		; linkes Zeichen
+	LD	B,0
+	LD	C,A
+	LD	HL,ZEI80	; Zeichentabelle 80
+	ADD	HL,BC
+	EX	DE,HL		; linkes Zeichen in DE
+
+	POP	AF		; Zeichen
+	RLCA
+	RLCA
+	AND	3Ch		; rechtes Zeichen
+;	LD	B,0
+	LD	C,A
+	LD	HL,ZEI80	; Zeichentabelle 80
+	ADD	HL,BC
+	LD	B,H
+	LD	C,L		; rechtes Zeichen in BC
+
+	ld	hl,(cctl0)	; Zeichenbildtabelle
+	push	hl		; merken
+	ld	hl,ZHEX		; Zeichencode hier erstellen
+	ld	(cctl0),hl
+	LD	A,4
+HEX81:	PUSH	AF
+	ld	a,(de)		; links
+	RLCA
+	RLCA
+	RLCA
+	RLCA
+	rld			; die ersten 4 Bit vom linken Zeichen
+	ld	a,(bc)		; rechts
+	RLCA
+	RLCA
+	RLCA
+	RLCA
+	rld			; die zweiten 4 Bit vom rechten Zeichen
+	inc	hl		; naechste Pixelzeile
+
+	ld	a,(de)		; links
+	rld
+
+	ld	a,(bc)		; rechts
+	rld
+	inc	hl		; eine Pixelzeile weiter
+	inc	de		; Zeichencode links +1
+	inc	bc		; Zeichencode rechts +1
+	POP	AF
+	DEC	A		; Zaehler
+	JR	NZ,HEX81
+
+	ld	a,' '
+	ld	e,crt
+	call	pv3
+	pop	hl		; urspruengliche Zeichenbildtabelle
+	ld	(cctl0),hl	; regenerieren
+	pop	af
+	pop	bc
+	pop	de
+	pop	hl
+	RET
+;
+; 80-Zeichensatz fuer HEX-Anzeige beim Debugging
+;
+ZEI80:	DB	04Ah,0AAh,0AAh,040h	; 0
+	DB	026h,0A2h,022h,020h	; 1
+	DB	04Ah,022h,048h,0E0h	; 2
+	DB	04AH,024h,02Ah,040h	; 3
+	DB	088h,0AEh,022h,020h	; 4
+	DB	0E8h,08Eh,02Ah,040h	; 5
+	DB	04Ah,08Ch,0AAh,040h	; 6
+	DB	0e2h,022h,044h,040h	; 7
+	DB	04Ah,0A4h,0AAh,040h	; 8
+	DB	04Ah,0A6h,02Ah,040h	; 9
+	DB	04Ah,0AEh,0AAh,0A0h	; A
+	DB	0CAh,0ACh,0AAh,0C0h	; B
+	DB	04Ah,088h,08Ah,040h	; C
+	DB	0CAh,0AAh,0AAh,0C0h	; D
+	DB	0E8h,08Ch,088h,0E0h	; E
+	DB	0E8h,08Ch,088h,080h	; F
+;
+; Zeichencode 5CH (Backslash) und 7EH (Tilde)
+;
+ZEI5C:	DB	0C0H,060H,030H,018H,00CH,006H,002H,000H
+ZEI7E:	DB	076H,0DCH,000H,000H,000H,000H,000H,000H
+;
+; Fuer CAOS vor Version 4.7 gab es die Moeglichkeit, mittels UBASEX oder UDEVEX
+; auf USB zuzugreifen. In der USB-Software 2.3 waren dazu spezielle Menueworte
+; enthalten, welche es jetzt weiterhin als versteckte Menueworte gibt.
+;
+	include	ubasex.inc	; BASIC-Erweiterung
+	include udevex.inc	; EDAS-Erweiterung
+;
+; Software-Version anzeigen
+; CAOS 3.1 bis 4.2 zeigt dieses Menuewort an (CAOS 4.5 und 4.7 nicht)
+
+	DW	PROLOG3
+	DB	'ver',1
+	JR	ver4
+;
+	DW	PROLOG4
+	DB	'ver',1
+ver4:	CALL	PV1
+	DB	ostr
+	DB	'Versionsdatum: '
+	DATSTRING		; Datum
+	DB	CR,LF,0
+	RET
+
+; Verzeichnis anzeigen (CAOS, verstecktes Menuewort)
+
+	DW	7F7Fh
+	DB	'udir',1	; fuer alle CAOS-Versionen geeignet
+	call	minit		; Modul suchen, initialisieren
+	ret	c		; M052 nicht gefunden oder CAOS 2.2
+	CALL	PV1
+	DB	OSTR
+	DB	'Maske :',0
+	CALL	INPUT		; Eingabe
+	RET	C		; BRK ab CAOS 4.3
+	LD	HL,7
+	ADD	HL,DE		; Beginn der Eingabekette
+	EX	DE,HL		; als Maske jetzt in DE
+
+	call	sync		; mit Vinculum synchronisieren (ohne Anzeige)
+;	jr	c,EXIT2		; TimeOut
+	CALL	NC,UDIR		; Verzeichnis anzeigen
+	JP	EXIT2		; Modul aus und Interrupt: CAOS-Mode
+;
+; INLIN mit Abfrage BRK falls CAOS 4.3 oder hoeher
+; PA:	CY=1	BRK
+;
+INPUT:	CALL	PV1
+	DB	INLIN
+	RET	NC		; CY=0
+	LD	A,(VERSION)
+	CP	43h		; CY=1 ist ab CAOS 4.3 BRK!
+	ccf
+	ret
+
+	ABSFILL	0E000h,<ROM-Ende (M052)>
+
+ROMEND:
+	.DEPHASE
+
+	END
