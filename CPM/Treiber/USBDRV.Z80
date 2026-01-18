@@ -1,49 +1,57 @@
 ;------------------------------------------------------------------------------
 ;
-;	UTools Version 1.8 (von M. Leubner)
+;	UTools Version 1.9 (von M. Leubner)
 ;
-; Hilfsprogramme zur Arbeit mit USB-Sticks unter CP/M
+; Hilfsprogramme zur Arbeit mit USB-Sticks unter CP/M am KC85
 ;
 ;	DRV-Treiber fuer VDIP1 oder VDIP2 an Modul M052
 ;	mit Status-Abfrage per ESC-Befehl
 ;	(und Interrupt -> Koppel-RAM)
 ;
-; V1.0 (16.03.2008): zyklischer CTC-Interrupt
+; V1.0	16.03.2008:  zyklischer CTC-Interrupt
 ;
-; V1.1 (20.04.2008): PIO-Interrupt - modifizierter Schaltplan!
-;	20.07.2008 : Fehlerkorrektur falls Modul nicht vorhanden
+; V1.1	20.04.2008:  PIO-Interrupt - modifizierter Schaltplan!
+;	20.07.2008:  Fehlerkorrektur falls Modul nicht vorhanden
 ;
-; V1.2 (31.01.2009): Bit 6+7 von PIO-Port B auf "1" gesetzt
+; V1.2	31.01.2009:  Bit 6+7 von PIO-Port B auf "1" gesetzt
 ;		     damit kein Problem an #RESET & #PROG
 ;		   - Version fuer M001 und M052 anpassbar
 ;
-; V1.3 (18.10.2009): Extra-Treiber M052.DRV um Modul zu schalten,
+; V1.3	18.10.2009:  Extra-Treiber M052.DRV um Modul zu schalten,
 ;		   - M001 nicht mehr unterstuetzt
 ;
-; V1.4 (01.03.2019): mit USB-Tastatur fuer VNC2 ueber M052-Interrupt
+; V1.4	01.03.2019:  mit USB-Tastatur fuer VNC2 ueber M052-Interrupt
 ;
-; V1.5 (08.03.2019): mit USB-Tastatur fuer VNC2 ueber, Interrupt im Treiber
+; V1.5	08.03.2019:  mit USB-Tastatur fuer VNC2 ueber, Interrupt im Treiber
 ;		     mit Zwischenpuffer fuer FIFO-Daten
-;	16.03.2019 : FIFO-Daten bei INIT abholen, damit FIFO-Puffer im VNC leer
+;	16.03.2019:  FIFO-Daten bei INIT abholen, damit FIFO-Puffer im VNC leer
 ;		     wird und Interrupt auch bis CAOS 4.6 aktiv wird
-;	17.03.2019 : Bei Deinitialisierung Modul nicht per CALL C020H neu
+;	17.03.2019:  Bei Deinitialisierung Modul nicht per CALL C020H neu
 ;		     initialisieren - das macht spaeter DEP 3.4 oder RESET
 ;
-; V1.6 (06.04.2019): Original-Koppeltreiber jedes Mal bei UMEIN merken
+; V1.6	06.04.2019:  Original-Koppeltreiber jedes Mal bei UMEIN merken
 ;
-; V1.7 (02.05.2021): Reihenfolge der PIO-Initialisierung geaendert, damit kein
+; V1.7	02.05.2021:  Reihenfolge der PIO-Initialisierung geaendert, damit kein
 ;		     unbeabsichtigter RESET ausgeloest wird.
 ;
-; V1.8 (19.04.2022): Zusatzeingabe: Interrupt schreibt gleich in den Puffer des
+; V1.8	19.04.2022:  Zusatzeingabe: Interrupt schreibt gleich in den Puffer des
 ;		     Koppel-RAM ohne auf die Anforderung vom BIOS zu warten
-;	21.04.2022 : Das Prinzip funktioniert nur mit ZAS-Version fuer
+;	21.04.2022:  Das Prinzip funktioniert nur mit ZAS-Version fuer
 ;		     "Koppeltreiber neu", denn nur bei diesem wird bei Rueckkehr
 ;		     mit CY=1 kein Zeichen verarbeitet. Bei Eingabeanforderung
 ;		     muss jedoch noch geprueft werden, ob noch neue Daten
 ;		     abgeholt werden muessen. GET prueft dies nun nur noch,
 ;		     uebergibt die Daten aber dennoch direkt in den Koppel-RAM
-;	14.08.2022 : Kontrolle, ob passende ZAS-Version ab 1.7 vorhanden ist.
+;	14.08.2022:  Kontrolle, ob passende ZAS-Version ab 1.7 vorhanden ist.
 ;		     Falls nicht, laesst sich der Treiber nicht aktivieren
+;
+; V1.9	18.01.2026:  Wenn Deinitialisierung aufgerufen wird, ohne dass zuvor
+;		     jemals ein USB-Zugriff mit Umleitung auf den Koppeltreiber
+;		     erfolgt ist, ueberschreibt die Deinitialisierung den
+;		     Koppeltreiber mit Nullen. Deshalb wird zusaetzlich schon
+;		     bei der Initialisierung MEM mit Daten gefuellt.
+;		     (Fehler bemerkt beim Laden von CPM.KCC: CALL 0380H fuehrte
+;		     zum Absturz, loeschte den Bildschirm nicht usw.)
 ;
 ; Funktion der USB-Tastatur: Wenn ein M052 mit Software 2.7 oder hoeher steckt,
 ; dann wird INIT vom M052 aufgerufen und anschliessend FILE-Mode eingestellt.
@@ -118,7 +126,7 @@ ST_WR	EQU	11111100b	; FCH:		WR=1
 
 TOP:	JR	START			; Programmverteiler
 ID:	DB	26			; ID fuer USB-Treiber
-	DB	18H			; Version 1.8
+	DB	19H			; Version 1.9
 	DB	00H or High (SIZE-1)	; Speicherbedarf
 USE:	DB	0			; USE-Counter
 SUB1:	DB	28			; Treiber M052.DRV erforderlich
@@ -179,7 +187,7 @@ DATA:	DB	3		; 3 Ports
 START:	OR	A
 	JR	Z,INIT		; A=0 Initialisierung
 	DEC	A
-	JR	Z,DINIT		; A=1 Deinitialisierung
+	JP	Z,DINIT		; A=1 Deinitialisierung
 	DEC	A
 	JP	Z,UMEIN		; A=2 Umleitung Koppeltreiber ein
 	DEC	A
@@ -270,6 +278,11 @@ sync2:	; Ringpufferzeiger ruecksetzen
 	OUT	(C),A		; an CP/M melden
 
 ; Einsprungtabelle vom Original-Koppeltreiber merken:
+
+	ld	hl,0380h	; Speicherplatz Koppeltreiber
+	ld	de,mem		; Zwischenspeicher
+	ld	bc,ksize
+	ldir			; Originaldaten merken
 
 INIT1:	LD	HL,USE
 	INC	(HL)		; eigenen USE-Counter erhoehen
@@ -457,7 +470,7 @@ SIZE	EQU	$-TOP	; Speicherbedarf
 ;*** Codeende **************************
 
 IF2
-	.PRINTX "USB-Treiber 1.8 fuer M052"
+	.PRINTX "USB-Treiber 1.9 fuer M052"
 	.RADIX  16
 	PRMSG   <Speicherbedarf=>,%SIZE
 	.RADIX  10
