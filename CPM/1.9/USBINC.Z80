@@ -1,6 +1,6 @@
 ;-----------------------------------------------------
 ;
-;	UTools Version 1.8 (von M. Leubner)
+;	UTools Version 1.9 (von M. Leubner)
 ;
 ; Hilfsprogramme zur Arbeit mit USB-Sticks unter CP/M
 ;
@@ -195,9 +195,9 @@ opt10:	inc	de
 	djnz	opt1
 opt11:
 	endm
-;
+
 ; Sprungtabelle fuer KC85 und Nicht-KC85-Systeme
-;
+
 GET:	JP	KCGET		; Zusatzeingabe mit Break und TimeOut
 PUT:	JP	POUT		; Zusatzausgabe (Koppeltreiber)
 STATUS:	JP	STAT17		; Status abfragen
@@ -207,9 +207,9 @@ STATUS:	JP	STAT17		; Status abfragen
 ; Erkennung ob D004 oder D008 V1.0 / V2.0 vorliegt,
 ; Danach die Taktfrequenz ermitteln und im CONFIG-Bereich eintragen
 GETTAKT:
-;
+
 ; 1. Suche der KC85-Kennung im BIOS
-;
+
 	LD	C,_GETDRV	; aktuelles BDOS-Laufwerk holen
 	CALL	BDOS
 	LD	(DOSDRV),A	; und merken
@@ -220,7 +220,7 @@ DOSDRV	EQU	$+1
 	LD	C,0		; BDOS-Laufwerk sofort wieder regenerieren
 	CALL	SELDSK		; Laufwerk im BIOS vorwaehlen
 	POP	HL
-;
+
 ; 10.04.2022: Beim BIOS des KC85 steht unmittelbar vor den DPH-Adressen die
 ; Kennung "85". Diese wird hier gesucht und zur Unterscheidung KC-System oder
 ; anderes CP/M-System verwendet.
@@ -234,7 +234,7 @@ DOSDRV	EQU	$+1
 ; direkt zugegriffen. Voraussetzung: PIO ist in Zugriff.
 ; 19.11.2024: Beim CP/M im KC85-Grundgeraet darf die PIO nicht neu initialisiert
 ; werden. Deshalb wird das zusaetzlich noch mit abgetestet
-;
+
 FIND1:	LD	A,(HL)
 	CP	'5'
 	JR	NZ,FIND2
@@ -255,9 +255,9 @@ NOTKC:	LD	HL,CPMGET
 	LD	HL,CPMST
 	LD	(STATUS+1),HL
 	RET
-;
+
 ; 2. Ermittlung der Geraetetype (KC85 Grundgeraet)
-;
+
 FIND3:	INC	HL
 	LD	A,(HL)		; drittes Kennbyte
 	OR	A
@@ -272,9 +272,9 @@ D001:	LD	(D34),A		; KC85-Type in Versionsanzeige
 	LD	A,2
 	LD	(TAKT),A	; CPU-Taktfrequenz = 2 MHz
 	JR	NOTKC		; ansonsten die CP/M-Routinen benutzen
-;
+
 ; 3. Ermittlung der Geraetetype (D004/D008) und der aktuellen Taktfrequenz
-;
+
 D004:	IN	A,(12h)		; D008 V1.0 Erkennung
 	AND	0FEH		; Bits 1-7 testen
 	JR	Z,T1		; alle 7 Bits=0, koennte also D008 V1.0 sein
@@ -318,7 +318,7 @@ D8:	LD	(D01),HL	; D008-Version eintragen
 D4:	LD	A,C
 	LD	(TAKT),A	; CPU-Taktfrequenz in MHz
 	RET
-;
+
 ; USB initialisieren und synchronisieren:
 ;
 ; PA:	CY=1	Break, TimeOut oder Error
@@ -378,8 +378,6 @@ PINIT:	ld	a,(port)	; PIO-Basisadresse
 	out	(c),a
 	ld	a,07H		; DI, Maske folgt nicht
 	out	(c),a
-;	ld	a,0FFH		; kein Bit aktiv
-;	out	(c),a
 	dec	c		; PIO A Steuerbyte
 	dec	c		; PIO B Daten
 	ld	a,0C4H		; #PROG=1, #RESET=1, RD&WR inaktiv
@@ -557,7 +555,7 @@ brk2:	call	status		; Status abfragen
 ; PA:	A	Datenbyte
 ;	CY=1	TimeOut
 ; VR:	AF
-;
+
 KCGET:	push	bc
 	ld	bc,1		; Zeitkonstante
 kcget2:	call	STATUS		; Status abfragen
@@ -684,8 +682,8 @@ ERRCHR:	DB	'\/"|+'		; Zeichen die unter DOS verboten sind
 
 ; Vinculum-Kommando ausfuehren:
 ;
-;PA:	CY=1	Fehler (VDIP1-Fehler oder BRK oder TimeOut)
-;VR:	AF
+; PA:	CY=1	Fehler (VDIP1-Fehler oder BRK oder TimeOut)
+; VR:	AF
 
 EXEC:	LD	A,CR	; Kommandoabschluss
 	CALL	PUT
@@ -794,11 +792,11 @@ KC34:	call	eprint
 nopio:	call	eprint
 	DB	cr,lf,' (c) 2008-2024, M. Leubner',cr,lf,0
 	ret
-;
+
 ; Versionsnummer x.y anzeigen
 ; PE:	A	BCD-Wert
 ; VR:	-
-;
+
 VERBCD:	push	af
 	rra
 	rra
@@ -817,10 +815,10 @@ AHEX0:	PUSH	AF
 	CALL	cout
 	POP	AF
 	RET
-;
+
 ; Treiberumleitung deaktivieren (vor EXIT):
 ; V1.4: vorher noch alle anliegenden Daten abholen
-;
+
 deinit:	LD	A,(TAKT)	; CPU-Taktfrequenz in MHz
 	LD	E,A		; E = Zaehlerwert fuer Zeitschleife
 deini2:	ld	bc,1		; KC85: Status aus Koppel-RAM lesen
@@ -921,7 +919,7 @@ PROZ1:	call	eprint
 ;
 ; PE:	BCDE	32-Bit-Zahl
 ; PA:	BCDE	Ergebnis
-;
+
 mul10:	SLA	E
 	RL	D
 	RL	C
